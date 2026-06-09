@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sr-dataset"
+version = "0.1.0"
+description = "Super-resolution dataset tooling for Sentinel-2 and PlanetScope imagery"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  "numpy",
+  "pandas",
+  "geopandas",
+  "shapely",
+  "tqdm",
+  "rasterio",
+  "requests",
+  "earthengine-api",
+  "planet",
+]
+
+[project.scripts]
+superres = "superres.entry:main"
+seagrass = "seagrass.entry:main"
+setup-sr-credentials = "setup_credentials:main"
+
+[tool.setuptools]
+py-modules = ["setup_credentials"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["common*", "seagrass*", "superres*"]
