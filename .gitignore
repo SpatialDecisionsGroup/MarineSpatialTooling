@@ -1,0 +1,10 @@
+# Repo-specific
+common/credentials.json
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.env
+*.venv
