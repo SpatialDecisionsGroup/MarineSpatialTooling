@@ -38,14 +38,25 @@ class Sentinel2Manager:
         self.turbidity_raster_path = turbidity_raster
         self.turbidity_dataset = None
         self._turbidity_transformer: Optional[Transformer] = None
-        # Try to open turbidity raster (NetCDF or GeoTIFF) if provided
         if self.turbidity_raster_path:
             try:
-                self.turbidity_dataset = rasterio.open(self.turbidity_raster_path)
+                path = self.turbidity_raster_path
+                # For NetCDF files, find the georeferenced subdataset (e.g. Kd_490)
+                if path.endswith(".nc"):
+                    try:
+                        with rasterio.open(path) as src:
+                            subs = src.subdatasets
+                        sub_path = next((s for s in subs if "Kd_490" in s), subs[0] if subs else None)
+                        if sub_path:
+                            path = sub_path
+                    except Exception as sub_err:
+                        self.logger.warning(f"Could not resolve NetCDF subdatasets: {sub_err}")
+
+                self.turbidity_dataset = rasterio.open(path)
                 # Transformer from WGS84 to raster CRS
                 if self.turbidity_dataset.crs:
                     self._turbidity_transformer = Transformer.from_crs("EPSG:4326", self.turbidity_dataset.crs, always_xy=True)
-                self.logger.info(f"Loaded turbidity raster: {self.turbidity_raster_path}")
+                self.logger.info(f"Loaded turbidity raster subdataset: {path}")
             except RasterioIOError as re:
                 self.logger.warning(f"Could not open turbidity raster {self.turbidity_raster_path}: {re}")
             except Exception as e:
@@ -143,6 +154,11 @@ class Sentinel2Manager:
                     x, y = (long, lat)
                     if self._turbidity_transformer is not None:
                         x, y = self._turbidity_transformer.transform(long, lat)
+                    
+                    scale = self.turbidity_dataset.scales[0] if self.turbidity_dataset.scales else 1.0
+                    offset = self.turbidity_dataset.offsets[0] if self.turbidity_dataset.offsets else 0.0
+                    nodata = self.turbidity_dataset.nodatavals[0] if self.turbidity_dataset.nodatavals else None
+
                     for val in self.turbidity_dataset.sample([(x, y)]):
                         if val is None:
                             return None
@@ -155,8 +171,9 @@ class Sentinel2Manager:
                             try:
                                 if v is None:
                                     continue
-                                if float(v) is not None:
-                                    return float(v)
+                                if nodata is not None and v == nodata:
+                                    continue
+                                return float(v) * scale + offset
                             except Exception:
                                 continue
                     return None

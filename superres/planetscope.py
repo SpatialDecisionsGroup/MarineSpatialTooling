@@ -5,7 +5,6 @@ PlanetScope data retrieval and processing.
 from __future__ import annotations
 
 import logging
-import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -23,7 +22,6 @@ class PlanetScopeManager:
     """Manages PlanetScope search, ordering, and downloads."""
 
     SEARCH_URL = "https://api.planet.com/data/v1/quick-search"
-    ACTIVATION_POLL_INTERVAL = 5
 
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key
@@ -195,6 +193,10 @@ class PlanetScopeManager:
             json=self.build_order_request(item_ids, aoi_geometry, alignment_crs, order_name),
             timeout=60,
         )
+        if not response.ok:
+            self.logger.error(
+                "Planet order creation failed (HTTP %s): %s", response.status_code, response.text
+            )
         response.raise_for_status()
         return response.json()
 
@@ -206,39 +208,6 @@ class PlanetScopeManager:
         )
         response.raise_for_status()
         return response.json()
-
-    def wait_for_order(self, order_id: str, timeout: int = 1800) -> Optional[Dict]:
-        start_time = time.time()
-        last_status_log = 0.0
-
-        while time.time() - start_time < timeout:
-            order = self.get_order(order_id)
-            state = order.get("state")
-            elapsed = int(time.time() - start_time)
-
-            if state in {"success", "partial"}:
-                return order
-            if state == "failed":
-                self.logger.error(
-                    "Planet order failed: %s",
-                    order.get("error_hints", order.get("last_message", "unknown error")),
-                )
-                return None
-
-            if elapsed - last_status_log >= 30 or elapsed == 0:
-                self.logger.info(
-                    "Waiting for Planet order %s: state=%s elapsed=%ss/%ss",
-                    order_id,
-                    state,
-                    elapsed,
-                    timeout,
-                )
-                last_status_log = float(elapsed)
-
-            time.sleep(self.ACTIVATION_POLL_INTERVAL)
-
-        self.logger.error("Planet order timeout for %s", order_id)
-        return None
 
     def download_result(self, url: str, output_path: Path) -> bool:
         try:
@@ -264,7 +233,8 @@ class PlanetScopeManager:
         output_dir.mkdir(parents=True, exist_ok=True)
 
         downloaded_paths: List[Path] = []
-        for result in order.get("results", []):
+        results = order.get("_links", {}).get("results") or []
+        for result in results:
             url = result.get("location")
             name = result.get("name")
             if not url or not name:

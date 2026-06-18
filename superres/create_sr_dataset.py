@@ -114,7 +114,12 @@ def create_dataset():
         config.load_gee_credentials(), config.load_gee_project(), turbidity_raster=getattr(config, "turbidity_file", None)
     )
     planetscope_manager = PlanetScopeManager(config.load_planet_api_key())
-    sampler = WorldPatchSampler(config.coastline_dir, config.gebco_file, logger)
+    sampler = WorldPatchSampler(
+        config.coastline_dir,
+        config.gebco_file,
+        logger,
+        turbidity_raster=getattr(config, "turbidity_file", None),
+    )
 
     print("=" * 60)
     print("Creating Super-Resolution Dataset")
@@ -253,6 +258,8 @@ def create_dataset():
                         SENTINEL2_MIN_IMAGES,
                         s2_seconds,
                     )
+                    if len(s2_images) < SENTINEL2_MIN_IMAGES:
+                        break
                     continue
 
                 turbidity_start = perf_counter()
@@ -288,7 +295,7 @@ def create_dataset():
                         candidate["depth_class"],
                         turbidity_info.get("turbidity_class"),
                     )
-                    continue
+                    break
 
                 sample = {
                     "location_id": current_total,

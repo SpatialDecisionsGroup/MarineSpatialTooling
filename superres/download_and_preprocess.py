@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict
 
 import numpy as np
 import pandas as pd
@@ -29,6 +29,46 @@ from .constants import (
 from .planetscope import PlanetScopeManager
 from .sentinel2 import Sentinel2Manager
 from common.dataset_utils import ensure_directory, setup_logger
+
+
+def _sentinel2_files_present(sample_dir: Path, expected_count: int) -> bool:
+    """Check whether the expected Sentinel-2 rasters already exist on disk."""
+    if expected_count <= 0:
+        return True
+    s2_dir = sample_dir / "sentinel2"
+    if not s2_dir.exists():
+        return False
+    return len(list(s2_dir.glob("sentinel2_*.tif"))) >= expected_count
+
+
+def _planetscope_standardized_file(sample_dir: Path, location_id: int) -> Path:
+    return sample_dir / "planetscope" / f"planetscope_{location_id:06d}.tif"
+
+
+def _planetscope_order_checkpoint_file(sample_dir: Path) -> Path:
+    return sample_dir / "planetscope" / "order_id.json"
+
+
+def _load_planetscope_order_id(sample_dir: Path) -> str:
+    checkpoint_file = _planetscope_order_checkpoint_file(sample_dir)
+    if not checkpoint_file.exists():
+        return ""
+    try:
+        with open(checkpoint_file) as file_handle:
+            return json.load(file_handle).get("order_id", "")
+    except (json.JSONDecodeError, OSError):
+        return ""
+
+
+def _save_planetscope_order_id(sample_dir: Path, order_id: str) -> None:
+    checkpoint_file = _planetscope_order_checkpoint_file(sample_dir)
+    checkpoint_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(checkpoint_file, "w") as file_handle:
+        json.dump({"order_id": order_id}, file_handle)
+
+
+def _clear_planetscope_order_id(sample_dir: Path) -> None:
+    _planetscope_order_checkpoint_file(sample_dir).unlink(missing_ok=True)
 
 
 def download_sentinel2_images(sample_metadata, sample_dir, logger, sentinel2_manager, count):
@@ -161,8 +201,10 @@ def download_planetscope_order(sample_metadata, sample_dir, logger, planetscope_
             logger.warning(f"Missing PlanetScope order inputs for location {sample_metadata['location_id']}")
             return False
 
-        order_id = sample_metadata.get("planet_order_id")
-        if not order_id:
+        order_id = sample_metadata.get("planet_order_id") or _load_planetscope_order_id(sample_dir)
+        if order_id:
+            logger.info(f"Checking existing Planet order {order_id} for sample {sample_metadata['location_id']}")
+        else:
             order_name = f"sr-patch-{int(sample_metadata['location_id']):06d}"
             order_response = planetscope_manager.create_order(
                 planet_item_ids,
@@ -174,18 +216,35 @@ def download_planetscope_order(sample_metadata, sample_dir, logger, planetscope_
             if not order_id:
                 logger.error(f"Planet order creation did not return an order id for sample {sample_metadata['location_id']}")
                 return False
-            sample_metadata["planet_order_id"] = order_id
+            _save_planetscope_order_id(sample_dir, order_id)
+            logger.info(f"Placed Planet order {order_id} for sample {sample_metadata['location_id']}")
+        sample_metadata["planet_order_id"] = order_id
 
-        order = planetscope_manager.wait_for_order(order_id)
-        if not order:
-            logger.error(f"Planet order {order_id} did not complete successfully")
+        order = planetscope_manager.get_order(order_id)
+        state = order.get("state")
+
+        if state == "failed":
+            logger.error(
+                "Planet order %s for sample %s failed: %s",
+                order_id,
+                sample_metadata["location_id"],
+                order.get("error_hints") or order.get("last_message", "unknown error"),
+            )
+            _clear_planetscope_order_id(sample_dir)
+            return False
+
+        if state not in {"success", "partial"}:
+            logger.info(
+                f"Planet order {order_id} for sample {sample_metadata['location_id']} is still "
+                f"'{state}'; will check again on the next run"
+            )
             return False
 
         ps_dir = ensure_directory(sample_dir / "planetscope")
         order_dir = ensure_directory(ps_dir / order_id)
         downloaded_paths = planetscope_manager.download_order_results(order, order_dir)
         if not downloaded_paths:
-            logger.error(f"No PlanetScope results downloaded for order {order_id}")
+            logger.error(f"No PlanetScope results downloaded for order {order_id} (state={state})")
             return False
 
         raster_candidates = [path for path in downloaded_paths if path.suffix.lower() in {".tif", ".tiff"}]
@@ -193,7 +252,10 @@ def download_planetscope_order(sample_metadata, sample_dir, logger, planetscope_
             logger.error(f"No raster outputs found for Planet order {order_id}")
             return False
 
-        source_raster = raster_candidates[0]
+        source_raster = next(
+            (path for path in raster_candidates if "analyticms" in path.name.lower()),
+            raster_candidates[0],
+        )
         standardized_file = ps_dir / f"planetscope_{int(sample_metadata['location_id']):06d}.tif"
         if not standardize_planetscope_patch(source_raster, standardized_file, sample_metadata, logger):
             return False
@@ -244,7 +306,7 @@ def download_sample(
             "target_origin_x": float(row.get("target_origin_x", 0.0)),
             "target_origin_y": float(row.get("target_origin_y", 0.0)),
             "planet_item_ids": row.get("planet_item_ids", []),
-            "planet_order_id": str(row.get("planet_order_id", "")),
+            "planet_order_id": "" if pd.isna(row.get("planet_order_id", "")) else str(row.get("planet_order_id", "")),
             "planet_product_bundle": str(row.get("planet_product_bundle", PLANETSCOPE_PRODUCT_BUNDLE)),
             "planet_aoi_geojson": row.get("planet_aoi_geojson", {}),
             "sentinel2_count": int(row.get("sentinel2_count", 0)),
@@ -254,20 +316,29 @@ def download_sample(
         s2_count = int(row.get("sentinel2_count", 0))
         s2_ok = True
         if s2_count > 0:
-            s2_ok = download_sentinel2_images(
+            if _sentinel2_files_present(sample_dir, s2_count):
+                logger.info(f"Sample {location_id}: Sentinel-2 images already on disk, skipping download")
+            else:
+                s2_ok = download_sentinel2_images(
+                    sample_metadata,
+                    sample_dir,
+                    logger,
+                    sentinel2_manager,
+                    s2_count,
+                )
+
+        standardized_file = _planetscope_standardized_file(sample_dir, location_id)
+        if standardized_file.exists():
+            logger.info(f"Sample {location_id}: PlanetScope raster already on disk, skipping download")
+            sample_metadata["planetscope_standardized_file"] = str(standardized_file)
+            ps_ok = True
+        else:
+            ps_ok = download_planetscope_order(
                 sample_metadata,
                 sample_dir,
                 logger,
-                sentinel2_manager,
-                s2_count,
+                planetscope_manager,
             )
-
-        ps_ok = download_planetscope_order(
-            sample_metadata,
-            sample_dir,
-            logger,
-            planetscope_manager,
-        )
 
         if s2_ok and ps_ok:
             with open(sample_metadata_file, "w") as file_handle:

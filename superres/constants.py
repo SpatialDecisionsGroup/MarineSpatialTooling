@@ -27,7 +27,7 @@ TARGET_CRS = "EPSG:4326"  # WGS84 - will be reprojected to UTM per location
 PATCH_SIZE_PIXELS = 512
 PATCH_SIZE_METERS = PATCH_SIZE_PIXELS * PLANETSCOPE_RESOLUTION
 
-ENVIRONMENT_CLASSES = ["river", "estuary", "offshore"]
+ENVIRONMENT_CLASSES = ["estuary", "offshore"]
 DEPTH_CLASSES = ["shallow_1", "shallow_2", "shallow_3"]
 TURBIDITY_CLASSES = ["clear", "moderate", "turbid"]
 

@@ -1,9 +1,9 @@
 import sys
 import argparse
 
-import superres.create_sr_dataset as create_sr_dataset
-import superres.download_and_preprocess as download_and_preprocess
-import superres.tile_dataset as tile_dataset
+from superres import create_sr_dataset
+from superres import download_and_preprocess
+from superres import tile_dataset
 
 parser = argparse.ArgumentParser(description="Superres dataset entry")
 subparsers = parser.add_subparsers(dest="action", required=True)
