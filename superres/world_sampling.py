@@ -14,6 +14,7 @@ import rasterio.transform
 from pyproj import Transformer
 from shapely.geometry import Point, box, mapping, shape
 from shapely.ops import transform, unary_union
+from shapely.prepared import prep
 
 from common.dataset_utils import get_utm_crs
 
@@ -269,6 +270,11 @@ class WorldPatchSampler:
         self.river_union = unary_union(self.river_geometry.geometry)
         self.coastline_union = self.land_union.boundary
 
+        # Prepared geometry for fast repeated .contains() checks during
+        # rejection sampling (GEOS builds an internal index once, instead of
+        # re-walking every land polygon's rings on every call).
+        self._land_union_prepared = prep(self.land_union)
+
         # Build (or load cached) depth-bin polygons from GEBCO
         self.depth_bin_gdf = build_gebco_depth_polygons(
             gebco_path=self.gebco_file,
@@ -288,6 +294,14 @@ class WorldPatchSampler:
         # Per-session cache of environment-intersected depth polygons
         # Key: (depth_class, environment_class) → Shapely geometry or None
         self._env_depth_polygon_cache = {}
+        # Per-session cache of prepared polygon components for point-in-polygon
+        # sampling. Key: id(polygon) → (components, prepared_components, weights).
+        # Safe because cached polygons live in _env_depth_polygon_cache for the
+        # lifetime of the sampler, so their ids won't be recycled.
+        self._polygon_components_cache = {}
+        # Per-session cache of buffered geometries used by the rejection-sampling
+        # fallback. Key: (id(geometry), buffer_meters) → (buffered, prepared_buffered).
+        self._buffered_geometry_cache = {}
 
         self.logger.info(
             "Loaded coastline and bathymetry sources: land=%s, rivers=%s, gebco=%s, depth_bins=%s",
@@ -507,7 +521,41 @@ class WorldPatchSampler:
         if polygon is None or polygon.is_empty:
             return None
 
-        # Decompose MultiPolygon into components for area-weighted selection
+        components, prepared_components, weights = self._get_prepared_components(polygon)
+        if weights is None:
+            return None
+
+        for _ in range(max_attempts):
+            # Pick a component proportional to its area
+            idx = int(self._rng.choice(len(components), p=weights))
+            comp = components[idx]
+            prepared_comp = prepared_components[idx]
+            minx, miny, maxx, maxy = comp.bounds
+
+            xs = self._rng.uniform(minx, maxx, batch_size)
+            ys = self._rng.uniform(miny, maxy, batch_size)
+            for x, y in zip(xs, ys):
+                pt = Point(x, y)
+                if prepared_comp.contains(pt):
+                    return pt
+
+        return None
+
+    def _get_prepared_components(self, polygon):
+        """Return (and cache) area-weighted components of *polygon* together
+        with prepared versions for fast repeated .contains() checks.
+
+        Building a prepared geometry costs a one-off index build; without
+        caching, every single point-in-polygon test in
+        ``_sample_point_in_polygon`` would re-walk the raw polygon's rings,
+        which dominates runtime when a stratum's candidate bank is empty and
+        hundreds of points are tested against the same cached polygon.
+        """
+        cache_key = id(polygon)
+        cached = self._polygon_components_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         if polygon.geom_type == "MultiPolygon":
             components = list(polygon.geoms)
         else:
@@ -515,24 +563,12 @@ class WorldPatchSampler:
 
         areas = np.array([c.area for c in components], dtype=float)
         total = areas.sum()
-        if total == 0:
-            return None
-        weights = areas / total
+        weights = areas / total if total > 0 else None
+        prepared_components = [prep(c) for c in components]
 
-        for _ in range(max_attempts):
-            # Pick a component proportional to its area
-            idx = int(self._rng.choice(len(components), p=weights))
-            comp = components[idx]
-            minx, miny, maxx, maxy = comp.bounds
-
-            xs = self._rng.uniform(minx, maxx, batch_size)
-            ys = self._rng.uniform(miny, maxy, batch_size)
-            for x, y in zip(xs, ys):
-                pt = Point(x, y)
-                if comp.contains(pt):
-                    return pt
-
-        return None
+        result = (components, prepared_components, weights)
+        self._polygon_components_cache[cache_key] = result
+        return result
 
     # ------------------------------------------------------------------
     # Patch geometry builder
@@ -639,7 +675,7 @@ class WorldPatchSampler:
         target = SampleTarget(environment_class, depth_class, TURBIDITY_CLASSES[0])
         for _ in range(max_attempts):
             point = self._sample_target_point(target)
-            if self.land_union.contains(point):
+            if self._land_union_prepared.contains(point):
                 continue
 
             point_environment = self._classify_environment(point)
@@ -678,17 +714,38 @@ class WorldPatchSampler:
                 return point
         return self.random_point()
 
-    def _sample_point_near_geometry(self, geometry, buffer_meters, max_attempts=500):
-        """Approximate biased rejection sampling toward a geometry buffer."""
+    def _get_buffered_geometry(self, geometry, buffer_meters):
+        """Return (and cache) a buffered geometry plus its prepared version.
+
+        ``geometry.buffer()`` is a real polygon-offsetting operation, not a
+        cheap lookup — recomputing it on every rejection-sampling attempt
+        (up to hundreds of times per candidate search) dominated runtime.
+        *geometry* and *buffer_meters* are always one of a handful of fixed
+        combinations, so caching by identity is safe for the sampler's
+        lifetime.
+        """
+        cache_key = (id(geometry), buffer_meters)
+        cached = self._buffered_geometry_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         buffer_degrees = buffer_meters / 111_320.0
         buffered = geometry.buffer(buffer_degrees)
+        prepared_buffered = prep(buffered)
+        result = (buffered, prepared_buffered)
+        self._buffered_geometry_cache[cache_key] = result
+        return result
+
+    def _sample_point_near_geometry(self, geometry, buffer_meters, max_attempts=500):
+        """Approximate biased rejection sampling toward a geometry buffer."""
+        buffered, prepared_buffered = self._get_buffered_geometry(geometry, buffer_meters)
         minx, miny, maxx, maxy = buffered.bounds
 
         for _ in range(max_attempts):
             longitude = float(self._rng.uniform(minx, maxx))
             latitude = float(self._rng.uniform(miny, maxy))
             point = Point(longitude, latitude)
-            if buffered.contains(point):
+            if prepared_buffered.contains(point):
                 return point
         return None
 
@@ -734,7 +791,7 @@ class WorldPatchSampler:
     def propose_candidate(self):
         """Propose a random candidate from anywhere in the ocean."""
         point = self.random_point()
-        if self.land_union.contains(point):
+        if self._land_union_prepared.contains(point):
             return None
 
         environment_class = self._classify_environment(point)
@@ -850,7 +907,7 @@ class WorldPatchSampler:
         target = SampleTarget(environment_class, depth_class, turbidity_class)
         for _ in range(max_attempts):
             point = self._sample_target_point(target)
-            if point is None or self.land_union.contains(point):
+            if point is None or self._land_union_prepared.contains(point):
                 continue
 
             point_environment = self._classify_environment(point)
