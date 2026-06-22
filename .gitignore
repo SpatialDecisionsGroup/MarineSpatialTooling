@@ -1,6 +1,10 @@
 # Repo-specific
 common/credentials.json
 data/
+sr_dataset.egg-info/
+*.log
+*.csv
+*.json
 
 # Python
 __pycache__
