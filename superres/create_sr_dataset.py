@@ -19,25 +19,22 @@ from .config import config_create
 from .constants import (
     DEPTH_CLASSES,
     ENVIRONMENT_CLASSES,
-    IMAGES_PER_LOCATION,
-    PATCH_SIZE_METERS,
+    LOWRES_MAX_IMAGES,
+    LOWRES_MIN_IMAGES,
     PATCH_SIZE_PIXELS,
     PLANETSCOPE_PRODUCT_BUNDLE,
-    PLANETSCOPE_RESOLUTION,
-    SENTINEL2_MIN_IMAGES,
-    SENTINEL2_MAX_IMAGES,
-    SENTINEL2_TURBIDITY_BUFFER_METERS,
+    TURBIDITY_BUFFER_METERS,
     TURBIDITY_CLASSES,
 )
+from .gee_satellite import GEESatelliteManager
 from .metadata import DatasetMetadata
-from .planetscope import PlanetScopeManager
-from .sentinel2 import Sentinel2Manager
+from .satellites import build_highres_manager, build_lowres_manager
 from .world_sampling import SampleTarget, WorldPatchSampler
 
 
-PLANETSCOPE_ARCHIVE_START = "2016-01-01"
-PLANETSCOPE_ARCHIVE_END = date.today().isoformat()
-SENTINEL2_WINDOW_DAYS = 45
+HIGHRES_SEARCH_START = "2016-01-01"
+HIGHRES_SEARCH_END = date.today().isoformat()
+LOWRES_WINDOW_DAYS = 45
 
 
 def _season_id_from_month(month: int) -> int:
@@ -99,6 +96,35 @@ def _find_matching_target(
     return None
 
 
+def _sort_by_quality(images: List[Dict]) -> List[Dict]:
+    """Sort image candidates best-first (lowest cloud cover, then earliest date)."""
+    def sort_key(image):
+        try:
+            cloud_cover = float(image.get("cloud_cover", 100) or 100)
+        except (TypeError, ValueError):
+            cloud_cover = 100.0
+        return (cloud_cover, str(image.get("date", "")))
+
+    return sorted(images, key=sort_key)
+
+
+def _build_highres_identifier_fields(highres_manager, highres_image: Dict, aoi_geojson: Dict) -> Dict:
+    """Build the highres-specific sample fields, branching on the provider's download mechanism."""
+    if isinstance(highres_manager, GEESatelliteManager):
+        return {
+            "highres_item_ids": [highres_image["asset_id"]],
+            "highres_order_id": "",
+            "highres_product_bundle": "",
+            "highres_aoi_geojson": aoi_geojson,
+        }
+    return {
+        "highres_item_ids": [highres_image["id"]],
+        "highres_order_id": "",
+        "highres_product_bundle": PLANETSCOPE_PRODUCT_BUNDLE,
+        "highres_aoi_geojson": aoi_geojson,
+    }
+
+
 def create_dataset():
     """Create the complete world-scale super-resolution dataset."""
     config = config_create()
@@ -110,23 +136,34 @@ def create_dataset():
 
     logger = setup_logger("SRDatasetCreator", config.metadata_dir / "creation.log", level=logging.DEBUG)
 
-    sentinel2_manager = Sentinel2Manager(
-        config.load_gee_credentials(), config.load_gee_project(), turbidity_raster=getattr(config, "turbidity_file", None)
-    )
-    planetscope_manager = PlanetScopeManager(config.load_planet_api_key())
+    lowres_manager = build_lowres_manager(config)
+    highres_manager = build_highres_manager(config)
+
+    patch_size_meters = PATCH_SIZE_PIXELS * highres_manager.resolution_meters()
     sampler = WorldPatchSampler(
         config.coastline_dir,
         config.gebco_file,
         logger,
         turbidity_raster=getattr(config, "turbidity_file", None),
+        patch_size_meters=patch_size_meters,
+    )
+
+    metadata.add_dataset_info(
+        {
+            "lowres_satellite": config.lowres_satellite,
+            "lowres_resolution_meters": lowres_manager.resolution_meters(),
+            "highres_satellite": config.highres_satellite,
+            "highres_resolution_meters": highres_manager.resolution_meters(),
+        }
     )
 
     print("=" * 60)
     print("Creating Super-Resolution Dataset")
     print("=" * 60)
+    print(f"Low-res satellite: {config.lowres_satellite} ({lowres_manager.resolution_meters():.0f} m)")
+    print(f"High-res satellite: {config.highres_satellite} ({highres_manager.resolution_meters():.0f} m)")
     print(f"Patch size: {PATCH_SIZE_PIXELS} x {PATCH_SIZE_PIXELS} pixels")
-    print(f"Ground size: {PATCH_SIZE_METERS:.0f} m x {PATCH_SIZE_METERS:.0f} m")
-    print(f"Planet bundle: {PLANETSCOPE_PRODUCT_BUNDLE}")
+    print(f"Ground size: {patch_size_meters:.0f} m x {patch_size_meters:.0f} m")
 
     bank_start = perf_counter()
     sampler.build_candidate_bank(per_environment_depth=24)
@@ -208,67 +245,69 @@ def create_dataset():
                 candidate["longitude"],
             )
 
-            planet_start = perf_counter()
-            planetary_candidates = planetscope_manager.retrieve_images(
-                candidate["latitude"],
-                candidate["longitude"],
-                PLANETSCOPE_ARCHIVE_START,
-                PLANETSCOPE_ARCHIVE_END,
-                8,
+            aoi_geojson = sampler.patch_geojson(candidate["patch_polygon"])
+
+            highres_start = perf_counter()
+            highres_candidates = _sort_by_quality(
+                highres_manager.retrieve_images(
+                    candidate["latitude"],
+                    candidate["longitude"],
+                    HIGHRES_SEARCH_START,
+                    HIGHRES_SEARCH_END,
+                    8,
+                )
             )
-            planet_seconds = perf_counter() - planet_start
-            if not planetary_candidates:
+            highres_seconds = perf_counter() - highres_start
+            if not highres_candidates:
                 logger.debug(
-                    "No PlanetScope catalog candidates at (%.6f, %.6f) for target %s/%s/%s after %.2fs",
+                    "No high-res catalog candidates at (%.6f, %.6f) for target %s/%s/%s after %.2fs",
                     candidate["latitude"],
                     candidate["longitude"],
                     target.environment_class,
                     target.depth_class,
                     target.turbidity_class,
-                    planet_seconds,
+                    highres_seconds,
                 )
                 continue
 
             accepted = False
-            for ps_image in planetary_candidates:
-                ps_date = str(ps_image.get("date", ""))[:10]
-                if len(ps_date) != 10:
+            for highres_image in highres_candidates:
+                highres_date_str = str(highres_image.get("date", ""))[:10]
+                if len(highres_date_str) != 10:
                     continue
 
-                ps_day = date.fromisoformat(ps_date)
-                s2_window_start = (ps_day - timedelta(days=SENTINEL2_WINDOW_DAYS)).isoformat()
-                s2_window_end = (ps_day + timedelta(days=SENTINEL2_WINDOW_DAYS)).isoformat()
+                highres_day = date.fromisoformat(highres_date_str)
+                lowres_window_start = (highres_day - timedelta(days=LOWRES_WINDOW_DAYS)).isoformat()
+                lowres_window_end = (highres_day + timedelta(days=LOWRES_WINDOW_DAYS)).isoformat()
 
-                s2_start = perf_counter()
-                s2_images = sentinel2_manager.retrieve_images(
+                lowres_start = perf_counter()
+                lowres_images = lowres_manager.retrieve_images(
                     candidate["latitude"],
                     candidate["longitude"],
-                    s2_window_start,
-                    s2_window_end,
-                    IMAGES_PER_LOCATION,
-                    aoi_geometry=sampler.patch_geojson(candidate["patch_polygon"]),
+                    lowres_window_start,
+                    lowres_window_end,
+                    LOWRES_MAX_IMAGES,
+                    aoi_geometry=aoi_geojson,
                 )
-                s2_seconds = perf_counter() - s2_start
-                if len(s2_images) < SENTINEL2_MIN_IMAGES:
+                lowres_seconds = perf_counter() - lowres_start
+                if len(lowres_images) < LOWRES_MIN_IMAGES:
                     logger.debug(
-                        "Insufficient Sentinel-2 images (%s) for location (%.6f, %.6f); need %s after %.2fs",
-                        len(s2_images),
+                        "Insufficient low-res images (%s) for location (%.6f, %.6f); need %s after %.2fs",
+                        len(lowres_images),
                         candidate["latitude"],
                         candidate["longitude"],
-                        SENTINEL2_MIN_IMAGES,
-                        s2_seconds,
+                        LOWRES_MIN_IMAGES,
+                        lowres_seconds,
                     )
-                    if len(s2_images) < SENTINEL2_MIN_IMAGES:
-                        break
-                    continue
+                    break
 
                 turbidity_start = perf_counter()
-                turbidity_info = sentinel2_manager.estimate_turbidity_class(
+                turbidity_info = lowres_manager.estimate_turbidity_class(
                     candidate["latitude"],
                     candidate["longitude"],
-                    s2_window_start,
-                    s2_window_end,
-                    buffer_meters=SENTINEL2_TURBIDITY_BUFFER_METERS,
+                    lowres_window_start,
+                    lowres_window_end,
+                    buffer_meters=TURBIDITY_BUFFER_METERS,
                 )
                 turbidity_seconds = perf_counter() - turbidity_start
                 if not turbidity_info:
@@ -301,25 +340,24 @@ def create_dataset():
                     "location_id": current_total,
                     "latitude": candidate["latitude"],
                     "longitude": candidate["longitude"],
-                    "season_id": _season_id_from_month(ps_day.month),
+                    "season_id": _season_id_from_month(highres_day.month),
                     "province": "global",
                     "environment_class": matched_target.environment_class,
                     "depth_class": matched_target.depth_class,
                     "depth_m": candidate["depth_m"],
                     "turbidity_class": matched_target.turbidity_class,
                     "turbidity_index": turbidity_info["turbidity_index"],
-                    "date_range": (s2_window_start, s2_window_end),
-                    "sentinel2_images": s2_images,
-                    "planetscope_images": [ps_image],
+                    "date_range": (lowres_window_start, lowres_window_end),
+                    "lowres_satellite": config.lowres_satellite,
+                    "lowres_images": lowres_images,
+                    "highres_satellite": config.highres_satellite,
+                    "highres_images": [highres_image],
                     "alignment_crs": candidate["alignment_crs"],
                     "patch_size_pixels": candidate["patch_size_pixels"],
                     "patch_size_meters": candidate["patch_size_meters"],
                     "target_origin_x": candidate["target_origin_x"],
                     "target_origin_y": candidate["target_origin_y"],
-                    "planet_item_ids": [ps_image["id"]],
-                    "planet_order_id": "",
-                    "planet_product_bundle": PLANETSCOPE_PRODUCT_BUNDLE,
-                    "planet_aoi_geojson": sampler.patch_geojson(candidate["patch_polygon"]),
+                    **_build_highres_identifier_fields(highres_manager, highres_image, aoi_geojson),
                 }
                 metadata.add_sample(sample)
                 current_total += 1
@@ -329,7 +367,7 @@ def create_dataset():
                 metadata.update_dataset_sample_count(current_total)
                 metadata.save_checkpoint()
                 logger.info(
-                    "Accepted candidate at (%.6f, %.6f) into %s/%s/%s; remaining=%s; timings candidate=%.2fs planet=%.2fs s2=%.2fs turbidity=%.2fs total_run=%.2fs",
+                    "Accepted candidate at (%.6f, %.6f) into %s/%s/%s; remaining=%s; timings candidate=%.2fs highres=%.2fs lowres=%.2fs turbidity=%.2fs total_run=%.2fs",
                     candidate["latitude"],
                     candidate["longitude"],
                     matched_target.environment_class,
@@ -337,8 +375,8 @@ def create_dataset():
                     matched_target.turbidity_class,
                     remaining_counts[matched_target],
                     candidate_seconds,
-                    planet_seconds,
-                    s2_seconds,
+                    highres_seconds,
+                    lowres_seconds,
                     turbidity_seconds,
                     perf_counter() - run_start,
                 )
@@ -365,7 +403,8 @@ def create_dataset():
     print(f"  Depth classes: {', '.join(DEPTH_CLASSES)}")
     print(f"  Turbidity classes: {', '.join(TURBIDITY_CLASSES)}")
     print(f"  Patch size: {PATCH_SIZE_PIXELS}x{PATCH_SIZE_PIXELS} pixels")
-    print(f"  Planet product bundle: {PLANETSCOPE_PRODUCT_BUNDLE}")
+    print(f"  Low-res satellite: {config.lowres_satellite}")
+    print(f"  High-res satellite: {config.highres_satellite}")
     print(f"\nOutputs:")
     print(f"  Metadata JSON: {json_file}")
     print(f"  Manifest CSV: {csv_file}")

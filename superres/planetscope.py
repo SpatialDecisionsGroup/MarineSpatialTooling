@@ -15,6 +15,7 @@ from .constants import (
     PLANETSCOPE_ITEM_TYPE,
     PLANETSCOPE_ORDERS_URL,
     PLANETSCOPE_PRODUCT_BUNDLE,
+    PLANETSCOPE_RESOLUTION,
 )
 
 
@@ -25,7 +26,11 @@ class PlanetScopeManager:
 
     def __init__(self, api_key: Optional[str] = None):
         self.api_key = api_key
-        self.logger = logging.getLogger("PlanetScopeManager")
+        self.logger = logging.getLogger(self.__class__.__name__)
+
+    @classmethod
+    def resolution_meters(cls) -> float:
+        return PLANETSCOPE_RESOLUTION
 
     def _auth(self) -> tuple[str, str]:
         return self.api_key or "", ""
@@ -168,7 +173,7 @@ class PlanetScopeManager:
                 {
                     "reproject": {
                         "projection": alignment_crs,
-                        "resolution": 3,
+                        "resolution": PLANETSCOPE_RESOLUTION,
                         "kernel": "bilinear",
                     }
                 },

@@ -89,47 +89,36 @@ def tile_dataset():
 
     logger = setup_logger("TileDataset", output_dir / "tiling.log")
     logger.info(f"Starting dataset tiling from {data_dir}")
-    
+
     tile_output = ensure_directory(output_dir / "tiles")
-    sentinel2_tile_dir = ensure_directory(tile_output / "sentinel2")
-    planetscope_tile_dir = ensure_directory(tile_output / "planetscope")
-    
-    s2_tile_count = 0
-    ps_tile_count = 0
-    
+
     sample_dirs = sorted([d for d in data_dir.iterdir() if d.is_dir() and d.name.startswith("sample_")])
-    
+
+    # Each sample directory holds one subfolder per satellite role (e.g.
+    # "landsat", "sentinel2", "planetscope") - discover and tile whichever
+    # are present instead of hardcoding role names.
+    tile_counts: dict = {}
+
     with tqdm(sample_dirs, desc="Tiling samples") as pbar:
         for sample_dir in pbar:
             location_id = sample_dir.name.replace("sample_", "")
-            
-            # Tile Sentinel-2 images
-            s2_dir = sample_dir / "sentinel2"
-            if s2_dir.exists():
-                s2_files = sorted(s2_dir.glob("*.tif"))
-                for s2_file in s2_files:
-                    img_name = s2_file.stem
-                    s2_sample_dir = ensure_directory(sentinel2_tile_dir / f"location_{location_id}")
-                    count = tile_raster(s2_file, s2_sample_dir, args.tile_size, f"s2_{img_name}")
-                    s2_tile_count += count
-            
-            # Tile PlanetScope images
-            ps_dir = sample_dir / "planetscope"
-            if ps_dir.exists():
-                ps_files = sorted(ps_dir.glob("*.tif"))
-                for ps_file in ps_files:
-                    img_name = ps_file.stem
-                    ps_sample_dir = ensure_directory(planetscope_tile_dir / f"location_{location_id}")
-                    count = tile_raster(ps_file, ps_sample_dir, args.tile_size, f"ps_{img_name}")
-                    ps_tile_count += count
-            
+
+            for role_dir in sorted(d for d in sample_dir.iterdir() if d.is_dir()):
+                role_files = sorted(role_dir.glob("*.tif"))
+                if not role_files:
+                    continue
+                role_tile_dir = ensure_directory(tile_output / role_dir.name / f"location_{location_id}")
+                for source_file in role_files:
+                    count = tile_raster(source_file, role_tile_dir, args.tile_size, f"{role_dir.name}_{source_file.stem}")
+                    tile_counts[role_dir.name] = tile_counts.get(role_dir.name, 0) + count
+
             pbar.update(1)
-    
+
     print("\n" + "=" * 60)
     print("Tiling complete!")
-    print(f"Sentinel-2 tiles: {s2_tile_count}")
-    print(f"PlanetScope tiles: {ps_tile_count}")
+    for role_name, count in sorted(tile_counts.items()):
+        print(f"{role_name} tiles: {count}")
     print(f"Output directory: {tile_output}")
     print("=" * 60)
-    
-    logger.info(f"Tiling complete: {s2_tile_count} S2 tiles, {ps_tile_count} PS tiles")
+
+    logger.info("Tiling complete: %s", tile_counts)

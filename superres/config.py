@@ -12,6 +12,12 @@ from .constants import (
     CREDENTIALS_SUBDIR,
     CREDENTIALS_CONFIG_FILENAME,
 )
+from .satellites import (
+    DEFAULT_HIGHRES_SATELLITE,
+    DEFAULT_LOWRES_SATELLITE,
+    HIGHRES_SATELLITES,
+    LOWRES_SATELLITES,
+)
 
 class Config:
     """Runtime configuration object for dataset creation and download."""
@@ -149,6 +155,18 @@ def config_create():
     sampling_group.add_argument("-p", "--samples-per-area", type=int, help="Number of samples per environment/depth/turbidity stratum")
     
     parser.add_argument("-e", "--ecoregions", help="Path to Marine Ecoregions GeoPackage or dataset folder")
+    parser.add_argument(
+        "--lowres-satellite",
+        choices=sorted(LOWRES_SATELLITES),
+        default=DEFAULT_LOWRES_SATELLITE,
+        help=f"Satellite to use for the multi-image low-resolution stack (default: {DEFAULT_LOWRES_SATELLITE})",
+    )
+    parser.add_argument(
+        "--highres-satellite",
+        choices=sorted(HIGHRES_SATELLITES),
+        default=DEFAULT_HIGHRES_SATELLITE,
+        help=f"Satellite to use for the high-resolution target image (default: {DEFAULT_HIGHRES_SATELLITE})",
+    )
     parser.add_argument("--coastline-dir", default="./data/gshhg-shp-2.3.7", help="Path to the GSHHG/WDBII coastline dataset")
     parser.add_argument("--gebco-file", default="./data/gebco_2026_geotiff", help="Path to the GEBCO bathymetry GeoTIFF (defaults to auto-discovery under ./data)")
     parser.add_argument("--turbidity-file", default="./data/turbidity.nc", help="Path to turbidity raster (.nc or GeoTIFF) to use instead of API calls")
@@ -198,7 +216,9 @@ def config_create():
     config.include_ecoregions = include_list
     config.exclude_ecoregions = exclude_list
     config.resume = args.resume
-    
+    config.lowres_satellite = args.lowres_satellite
+    config.highres_satellite = args.highres_satellite
+
     return config
 
 def config_download():
@@ -207,6 +227,18 @@ def config_download():
     parser.add_argument("-o", "--output", default=DEFAULT_OUTPUT_DIR, help="Output directory")
     parser.add_argument("--resume", action="store_true", help="Skip samples that already have sample_metadata.json in the output directory")
     parser.add_argument("--turbidity-file", default="./data/turbidity.nc", help="Path to turbidity raster (.nc or GeoTIFF) to use instead of API calls")
+    parser.add_argument(
+        "--lowres-satellite",
+        choices=sorted(LOWRES_SATELLITES),
+        default=None,
+        help="Override the low-res satellite for rows missing it (older manifests); normally read per-row from the manifest",
+    )
+    parser.add_argument(
+        "--highres-satellite",
+        choices=sorted(HIGHRES_SATELLITES),
+        default=None,
+        help="Override the high-res satellite for rows missing it (older manifests); normally read per-row from the manifest",
+    )
     args = parser.parse_args()
     config = Config(
         output_dir=args.output,
@@ -214,6 +246,8 @@ def config_download():
         turbidity_file=getattr(args, "turbidity_file", None),
     )
     config.resume = args.resume
+    config.lowres_satellite = args.lowres_satellite
+    config.highres_satellite = args.highres_satellite
     return config
 
 def config_credentials():

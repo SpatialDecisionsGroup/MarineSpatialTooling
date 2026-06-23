@@ -19,11 +19,11 @@ from shapely.prepared import prep
 from common.dataset_utils import get_utm_crs
 
 from .constants import (
+    DEFAULT_PATCH_SIZE_METERS,
     DEPTH_BINS_METERS,
     DEPTH_CLASSES,
     ENVIRONMENT_CLASSES,
     ESTUARY_DISTANCE_METERS,
-    PATCH_SIZE_METERS,
     PATCH_SIZE_PIXELS,
     RIVER_DISTANCE_METERS,
     TURBIDITY_CLASSES,
@@ -226,10 +226,20 @@ class SampleTarget:
 class WorldPatchSampler:
     """Sample 512×512 PlanetScope patches from a global water stratification grid."""
 
-    def __init__(self, coastline_dir, gebco_file, logger, turbidity_raster=None):
+    def __init__(
+        self,
+        coastline_dir,
+        gebco_file,
+        logger,
+        turbidity_raster=None,
+        patch_size_meters=DEFAULT_PATCH_SIZE_METERS,
+        patch_size_pixels=PATCH_SIZE_PIXELS,
+    ):
         self.coastline_dir = Path(coastline_dir)
         self.gebco_file = self._resolve_gebco_file(gebco_file)
         self.logger = logger
+        self.patch_size_meters = patch_size_meters
+        self.patch_size_pixels = patch_size_pixels
         self._rng = np.random.default_rng()
 
         self.turbidity_raster_path = turbidity_raster
@@ -580,7 +590,7 @@ class WorldPatchSampler:
         backward = Transformer.from_crs(alignment_crs, "EPSG:4326", always_xy=True)
 
         center_x, center_y = forward.transform(longitude, latitude)
-        half_size = PATCH_SIZE_METERS / 2.0
+        half_size = self.patch_size_meters / 2.0
         min_x = center_x - half_size
         min_y = center_y - half_size
         max_x = center_x + half_size
@@ -593,8 +603,8 @@ class WorldPatchSampler:
             "patch_polygon": patch_wgs84,
             "target_origin_x": min_x,
             "target_origin_y": min_y,
-            "patch_size_pixels": PATCH_SIZE_PIXELS,
-            "patch_size_meters": PATCH_SIZE_METERS,
+            "patch_size_pixels": self.patch_size_pixels,
+            "patch_size_meters": self.patch_size_meters,
         }
 
     @staticmethod

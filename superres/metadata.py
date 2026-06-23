@@ -28,8 +28,10 @@ class DatasetMetadata:
             "dataset_info": {
                 "created_date": datetime.now().isoformat(),
                 "total_samples": 0,
-                "sentinel2_resolution": 10,
-                "planetscope_resolution": 3,
+                "lowres_satellite": "",
+                "lowres_resolution_meters": None,
+                "highres_satellite": "",
+                "highres_resolution_meters": None,
                 "max_cloud_cover": 20,
                 "crs": "EPSG:4326",
             },
@@ -110,12 +112,14 @@ class DatasetMetadata:
                     "patch_size_meters": sample.get("patch_size_meters", ""),
                     "target_origin_x": sample.get("target_origin_x", ""),
                     "target_origin_y": sample.get("target_origin_y", ""),
-                    "planet_item_ids": serialise(sample.get("planet_item_ids", [])),
-                    "planet_order_id": sample.get("planet_order_id", ""),
-                    "planet_product_bundle": sample.get("planet_product_bundle", ""),
-                    "planet_aoi_geojson": serialise(sample.get("planet_aoi_geojson", {})),
-                    "sentinel2_count": len(sample.get("sentinel2_images", [])),
-                    "planetscope_count": len(sample.get("planetscope_images", [])),
+                    "lowres_satellite": sample.get("lowres_satellite", ""),
+                    "lowres_count": len(sample.get("lowres_images", [])),
+                    "highres_satellite": sample.get("highres_satellite", ""),
+                    "highres_item_ids": serialise(sample.get("highres_item_ids", [])),
+                    "highres_order_id": sample.get("highres_order_id", ""),
+                    "highres_product_bundle": sample.get("highres_product_bundle", ""),
+                    "highres_aoi_geojson": serialise(sample.get("highres_aoi_geojson", {})),
+                    "highres_count": len(sample.get("highres_images", [])),
                 })
         
         return filepath
@@ -145,10 +149,10 @@ class DatasetMetadata:
                 for key in ("depth_m", "turbidity_index", "patch_size_meters", "target_origin_x", "target_origin_y"):
                     if row.get(key) not in (None, ""):
                         row[key] = float(row[key])
-                for key in ("patch_size_pixels", "sentinel2_count", "planetscope_count"):
+                for key in ("patch_size_pixels", "lowres_count", "highres_count"):
                     if row.get(key) not in (None, ""):
                         row[key] = int(row[key])
-                row["planet_item_ids"] = parse_json_field(row.get("planet_item_ids"))
-                row["planet_aoi_geojson"] = parse_json_field(row.get("planet_aoi_geojson"))
+                row["highres_item_ids"] = parse_json_field(row.get("highres_item_ids"))
+                row["highres_aoi_geojson"] = parse_json_field(row.get("highres_aoi_geojson"))
                 samples.append(row)
         return samples

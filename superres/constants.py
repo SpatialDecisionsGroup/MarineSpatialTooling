@@ -10,6 +10,25 @@ SENTINEL2_BAND_NAMES = [
     "B1", "B2", "B3", "B4", "B5", "B6", "B7", "B8",
     "B8A", "B11", "B12", "SCL", "AOT"
 ]
+SENTINEL2_CLOUD_COVER_PROPERTY = "CLOUDY_PIXEL_PERCENTAGE"
+SENTINEL2_RED_BAND = "B4"
+SENTINEL2_GREEN_BAND = "B3"
+
+# Landsat specifications (Collection 2, Level-2 surface reflectance).
+# Landsat 8 and 9 are merged into a single collection so the combined revisit
+# cadence (~8 days) is fast enough to fill a multi-image low-res stack.
+LANDSAT_RESOLUTION = 30  # meters
+LANDSAT_BANDS = 7
+LANDSAT_COLLECTIONS = [
+    "LANDSAT/LC08/C02/T1_L2",
+    "LANDSAT/LC09/C02/T1_L2",
+]
+LANDSAT_BAND_NAMES = [
+    "SR_B1", "SR_B2", "SR_B3", "SR_B4", "SR_B5", "SR_B6", "SR_B7", "QA_PIXEL",
+]
+LANDSAT_CLOUD_COVER_PROPERTY = "CLOUD_COVER"
+LANDSAT_RED_BAND = "SR_B4"
+LANDSAT_GREEN_BAND = "SR_B3"
 
 # PlanetScope specifications
 PLANETSCOPE_RESOLUTION = 3  # meters
@@ -19,13 +38,17 @@ PLANETSCOPE_PRODUCT_BUNDLE = "analytic_8b_sr_udm2"
 PLANETSCOPE_ORDERS_URL = "https://api.planet.com/compute/ops/orders/v2"
 
 # Dataset configuration
-SENTINEL2_MIN_IMAGES = 6  # Minimum S2 images per sample (reject if fewer)
-SENTINEL2_MAX_IMAGES = 8  # Target max S2 images per location
-IMAGES_PER_LOCATION = SENTINEL2_MAX_IMAGES  # Sentinel-2 images per PlanetScope image
+LOWRES_MIN_IMAGES = 6  # Minimum low-res images per sample (reject if fewer)
+LOWRES_MAX_IMAGES = 8  # Target max low-res images per location
+IMAGES_PER_LOCATION = LOWRES_MAX_IMAGES  # Low-res images per high-res image
 MAX_CLOUD_COVER = 20  # percent
 TARGET_CRS = "EPSG:4326"  # WGS84 - will be reprojected to UTM per location
 PATCH_SIZE_PIXELS = 512
-PATCH_SIZE_METERS = PATCH_SIZE_PIXELS * PLANETSCOPE_RESOLUTION
+# Ground footprint of a patch depends on which satellite is used as the
+# high-resolution target (chosen at runtime via --highres-satellite). This
+# default matches the current default high-res satellite (Sentinel-2, 10m)
+# and is only used as a fallback when a manifest row has no patch_size_meters.
+DEFAULT_PATCH_SIZE_METERS = PATCH_SIZE_PIXELS * SENTINEL2_RESOLUTION
 
 ENVIRONMENT_CLASSES = ["estuary", "offshore"]
 DEPTH_CLASSES = ["shallow_1", "shallow_2", "shallow_3"]
@@ -46,11 +69,10 @@ TURBIDITY_BINS = [
 RIVER_DISTANCE_METERS = 5000.0
 ESTUARY_DISTANCE_METERS = 30000.0
 OFFSHORE_DISTANCE_METERS = 50000.0
-SENTINEL2_TURBIDITY_BUFFER_METERS = 1500.0
+TURBIDITY_BUFFER_METERS = 1500.0
 
 # Tiling configuration
 TILE_SIZE_PIXELS = PATCH_SIZE_PIXELS  # 512×512 pixel tiles for training
-PLANETSCOPE_TILE_STRIDE = 512  # Non-overlapping tiles from full scenes
 
 # Seasonal date ranges (start_month, end_month); winter wraps across year-end.
 SEASONS = [
@@ -86,10 +108,12 @@ MANIFEST_COLUMNS = [
     "patch_size_meters",
     "target_origin_x",
     "target_origin_y",
-    "planet_item_ids",
-    "planet_order_id",
-    "planet_product_bundle",
-    "planet_aoi_geojson",
-    "sentinel2_count",
-    "planetscope_count",
+    "lowres_satellite",
+    "lowres_count",
+    "highres_satellite",
+    "highres_item_ids",
+    "highres_order_id",
+    "highres_product_bundle",
+    "highres_aoi_geojson",
+    "highres_count",
 ]
