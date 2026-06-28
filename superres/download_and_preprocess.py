@@ -96,12 +96,22 @@ def _download_buffer_degrees(patch_size_meters: float, latitude: float, margin: 
 def download_lowres_images(sample_metadata, sample_dir, logger, lowres_manager, count, lowres_key):
     """Download the low-resolution multi-image stack for a sample."""
     try:
+        # Same AOI polygon create_sr_dataset.py used to validate low-res availability for
+        # this sample (stored under "highres_aoi_geojson" since it's also the order/export
+        # footprint for the high-res image). Re-querying with just the center point instead
+        # of this polygon can find fewer images than creation did - e.g. when the point sits
+        # right at a satellite scene/path boundary - so reuse the same search geometry here.
+        aoi_geometry = sample_metadata.get("highres_aoi_geojson")
+        if isinstance(aoi_geometry, str):
+            aoi_geometry = json.loads(aoi_geometry)
+
         lowres_images = lowres_manager.retrieve_images(
             sample_metadata["latitude"],
             sample_metadata["longitude"],
             sample_metadata["date_range_start"],
             sample_metadata["date_range_end"],
             count,
+            aoi_geometry=aoi_geometry,
         )
 
         if not lowres_images:

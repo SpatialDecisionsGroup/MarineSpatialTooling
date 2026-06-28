@@ -9,6 +9,7 @@ from typing import Optional
 
 from .constants import (
     DEFAULT_OUTPUT_DIR,
+    METADATA_SUBDIR,
     CREDENTIALS_SUBDIR,
     CREDENTIALS_CONFIG_FILENAME,
 )
@@ -167,13 +168,29 @@ def config_create():
         default=DEFAULT_HIGHRES_SATELLITE,
         help=f"Satellite to use for the high-resolution target image (default: {DEFAULT_HIGHRES_SATELLITE})",
     )
+    parser.add_argument(
+        "--lowres-window-days",
+        type=int,
+        default=90,
+        help="Half-width in days of the date window searched for low-res images around each high-res date "
+             "(default: 90, i.e. a 180-day window). Wider windows find more cloud-free low-res passes in "
+             "cloudy regions at the cost of more temporal drift between the low-res stack and the high-res target.",
+    )
     parser.add_argument("--coastline-dir", default="./data/gshhg-shp-2.3.7", help="Path to the GSHHG/WDBII coastline dataset")
     parser.add_argument("--gebco-file", default="./data/gebco_2026_geotiff", help="Path to the GEBCO bathymetry GeoTIFF (defaults to auto-discovery under ./data)")
     parser.add_argument("--turbidity-file", default="./data/turbidity.nc", help="Path to turbidity raster (.nc or GeoTIFF) to use instead of API calls")
     parser.add_argument("--include-ecoregions", help="Comma-separated province names to include (prioritized). Use 'indonesia' for Indonesia regions.")
     parser.add_argument("--exclude-ecoregions", help="Comma-separated province names to exclude")
     parser.add_argument("--resume", action="store_true", help="Resume from an existing dataset_metadata.json in the output directory")
-    
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Before resuming, scan existing samples for ones whose download partially failed "
+             "(a sample_<id> directory exists under --output/data but has no sample_metadata.json "
+             "checkpoint - e.g. no low-res images were actually available for that location/date "
+             "window) and regenerate replacements for the same slot/stratum. Implies --resume.",
+    )
+
     args = parser.parse_args()
 
     # Determine total samples
@@ -215,16 +232,38 @@ def config_create():
     config.samples_per_area = samples_per_area
     config.include_ecoregions = include_list
     config.exclude_ecoregions = exclude_list
-    config.resume = args.resume
+    config.resume = args.resume or args.check
+    config.check_existing = args.check
     config.lowres_satellite = args.lowres_satellite
     config.highres_satellite = args.highres_satellite
+    config.lowres_window_days = args.lowres_window_days
 
     return config
+
+def _infer_output_dir_from_manifest(manifest_file: str) -> str:
+    """Infer the dataset output directory from a manifest path.
+
+    Manifests are written to <output_dir>/metadata/, so a manifest at
+    dataset/metadata/manifest.csv implies an output dir of dataset/ (and thus
+    data downloads to dataset/data/). Falls back to the manifest's own
+    directory if it isn't sitting in a "metadata" subfolder.
+    """
+    manifest_parent = Path(manifest_file).parent
+    if manifest_parent.name == METADATA_SUBDIR:
+        return str(manifest_parent.parent)
+    return str(manifest_parent)
+
 
 def config_download():
     parser = argparse.ArgumentParser(description="Download and preprocess SR dataset from manifest")
     parser.add_argument("manifest_file", help="Path to dataset_manifest.csv")
-    parser.add_argument("-o", "--output", default=DEFAULT_OUTPUT_DIR, help="Output directory")
+    parser.add_argument(
+        "-o",
+        "--output",
+        default=None,
+        help="Output directory (defaults to the manifest's dataset directory, e.g. "
+             "dataset/metadata/manifest.csv -> dataset/, so data lands in dataset/data/)",
+    )
     parser.add_argument("--resume", action="store_true", help="Skip samples that already have sample_metadata.json in the output directory")
     parser.add_argument("--turbidity-file", default="./data/turbidity.nc", help="Path to turbidity raster (.nc or GeoTIFF) to use instead of API calls")
     parser.add_argument(
@@ -240,8 +279,9 @@ def config_download():
         help="Override the high-res satellite for rows missing it (older manifests); normally read per-row from the manifest",
     )
     args = parser.parse_args()
+    output_dir = args.output or _infer_output_dir_from_manifest(args.manifest_file)
     config = Config(
-        output_dir=args.output,
+        output_dir=output_dir,
         manifest_file=args.manifest_file,
         turbidity_file=getattr(args, "turbidity_file", None),
     )

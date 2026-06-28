@@ -4,14 +4,16 @@ Multi-image super-resolution dataset creator for global water patches.
 
 from __future__ import annotations
 
+import logging
+import shutil
+from collections import deque
 from datetime import date, timedelta
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 from time import perf_counter
 
 import numpy as np
 from tqdm import tqdm
-import logging
 
 from common.dataset_utils import setup_logger
 
@@ -34,7 +36,6 @@ from .world_sampling import SampleTarget, WorldPatchSampler
 
 HIGHRES_SEARCH_START = "2016-01-01"
 HIGHRES_SEARCH_END = date.today().isoformat()
-LOWRES_WINDOW_DAYS = 45
 
 
 def _season_id_from_month(month: int) -> int:
@@ -125,6 +126,51 @@ def _build_highres_identifier_fields(highres_manager, highres_image: Dict, aoi_g
     }
 
 
+def _repair_broken_samples(metadata: DatasetMetadata, data_dir: Path, logger) -> List[int]:
+    """Drop samples whose download partially failed and return their freed location_ids.
+
+    A sample is "broken" if download_and_preprocess.py already created its data_dir/sample_<id>
+    folder (i.e. a download was attempted) but never wrote sample_metadata.json - the checkpoint
+    it only writes once both the low-res stack and high-res image succeed. The most common cause
+    is the low-res catalog query at download time turning up fewer images than the one that
+    validated this sample at creation time (see download_lowres_images' aoi_geometry handling).
+    Samples that were never attempted (no data_dir folder yet) are left untouched.
+    """
+    samples = metadata.metadata.get("samples", [])
+    broken, good = [], []
+    for sample in samples:
+        sample_dir = data_dir / f"sample_{int(sample['location_id']):06d}"
+        if sample_dir.exists() and not (sample_dir / "sample_metadata.json").exists():
+            broken.append(sample)
+        else:
+            good.append(sample)
+
+    if not broken:
+        logger.info("Check: no incomplete samples found among %s existing samples", len(samples))
+        print("Check: no incomplete samples found.")
+        return []
+
+    for sample in broken:
+        location_id = int(sample["location_id"])
+        sample_dir = data_dir / f"sample_{location_id:06d}"
+        logger.info(
+            "Check: sample %s (%s/%s/%s) has a partial download with no sample_metadata.json "
+            "checkpoint - deleting %s and regenerating a replacement",
+            location_id,
+            sample.get("environment_class"),
+            sample.get("depth_class"),
+            sample.get("turbidity_class"),
+            sample_dir,
+        )
+        shutil.rmtree(sample_dir, ignore_errors=True)
+
+    metadata.metadata["samples"] = good
+    freed_ids = sorted(int(sample["location_id"]) for sample in broken)
+    logger.info("Check: removed %s incomplete sample(s); will regenerate ids %s", len(freed_ids), freed_ids)
+    print(f"Check: found {len(freed_ids)} incomplete sample(s) on disk; regenerating: {freed_ids}")
+    return freed_ids
+
+
 def create_dataset():
     """Create the complete world-scale super-resolution dataset."""
     config = config_create()
@@ -135,6 +181,10 @@ def create_dataset():
         metadata = DatasetMetadata(config.metadata_dir)
 
     logger = setup_logger("SRDatasetCreator", config.metadata_dir / "creation.log", level=logging.DEBUG)
+
+    freed_location_ids: List[int] = []
+    if getattr(config, "check_existing", False):
+        freed_location_ids = _repair_broken_samples(metadata, config.data_dir, logger)
 
     lowres_manager = build_lowres_manager(config)
     highres_manager = build_highres_manager(config)
@@ -205,6 +255,21 @@ def create_dataset():
     remaining_counts = _remaining_target_counts(target_counts, existing_counts, targets)
     rng = np.random.default_rng()
     run_start = perf_counter()
+
+    # New samples normally get the next sequential id, but ids freed by _repair_broken_samples
+    # are reused first so a regenerated sample lands back in its original sample_<id> slot
+    # instead of colliding with (or appending after) the ids of untouched existing samples.
+    existing_location_ids = {int(sample["location_id"]) for sample in metadata.metadata.get("samples", [])}
+    free_location_ids = deque(sorted(set(freed_location_ids) - existing_location_ids))
+    next_new_location_id = max(existing_location_ids | set(freed_location_ids), default=-1) + 1
+
+    def _allocate_location_id() -> int:
+        nonlocal next_new_location_id
+        if free_location_ids:
+            return free_location_ids.popleft()
+        value = next_new_location_id
+        next_new_location_id += 1
+        return value
 
     with tqdm(total=total_samples, initial=current_total, desc="Acquiring paired samples") as pbar:
         while current_total < total_samples and attempts < max_attempts:
@@ -277,8 +342,8 @@ def create_dataset():
                     continue
 
                 highres_day = date.fromisoformat(highres_date_str)
-                lowres_window_start = (highres_day - timedelta(days=LOWRES_WINDOW_DAYS)).isoformat()
-                lowres_window_end = (highres_day + timedelta(days=LOWRES_WINDOW_DAYS)).isoformat()
+                lowres_window_start = (highres_day - timedelta(days=config.lowres_window_days)).isoformat()
+                lowres_window_end = (highres_day + timedelta(days=config.lowres_window_days)).isoformat()
 
                 lowres_start = perf_counter()
                 lowres_images = lowres_manager.retrieve_images(
@@ -337,7 +402,7 @@ def create_dataset():
                     break
 
                 sample = {
-                    "location_id": current_total,
+                    "location_id": _allocate_location_id(),
                     "latitude": candidate["latitude"],
                     "longitude": candidate["longitude"],
                     "season_id": _season_id_from_month(highres_day.month),
