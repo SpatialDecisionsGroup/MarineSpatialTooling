@@ -35,7 +35,7 @@ class GEESatelliteSpec:
     red_band: str = ""
     green_band: str = ""
     resolution_meters: float = 10.0
-    download_buffer_degrees: float = 0.05
+    download_buffer_meters: float = 5566.0
 
 
 class GEESatelliteManager:
@@ -333,7 +333,7 @@ class GEESatelliteManager:
         long: float,
         output_path: Path,
         bands: Optional[List[str]] = None,
-        buffer_degrees: Optional[float] = None,
+        buffer_meters: Optional[float] = None,
     ) -> bool:
         """Download an image from Earth Engine.
 
@@ -343,16 +343,16 @@ class GEESatelliteManager:
             long: Longitude for bounding box
             output_path: Local file path to save to
             bands: List of band names to export (defaults to all bands in SPEC)
-            buffer_degrees: Radius (in degrees) of the download region around (lat, long).
-                Defaults to SPEC.download_buffer_degrees.
+            buffer_meters: Radius (in meters) of the download region around (lat, long).
+                Defaults to SPEC.download_buffer_meters.
 
         Returns:
             True if download succeeded, False otherwise
         """
         if not bands:
             bands = self.SPEC.band_names
-        if buffer_degrees is None:
-            buffer_degrees = self.SPEC.download_buffer_degrees
+        if buffer_meters is None:
+            buffer_meters = self.SPEC.download_buffer_meters
 
         try:
             output_path = Path(output_path)
@@ -361,7 +361,9 @@ class GEESatelliteManager:
             # Select bands and create small region for download
             image = image.select(bands)
 
-            region = ee.Geometry.Point([long, lat]).buffer(buffer_degrees)
+            # ee.Geometry.buffer() takes its distance in true geodesic meters
+            # (latitude-independent), regardless of the geometry's coordinate units.
+            region = ee.Geometry.Point([long, lat]).buffer(buffer_meters)
 
             # Generate download URL. Do NOT force a geographic CRS together with a
             # meter-based scale; passing 'crs': 'EPSG:4326' with a meter scale causes

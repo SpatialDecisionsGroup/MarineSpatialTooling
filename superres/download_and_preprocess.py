@@ -39,7 +39,6 @@ from common.dataset_utils import ensure_directory, setup_logger
 # for a GEE-backed high-res image, before it gets warped onto the exact
 # manifest grid. Guards against clipping near the patch edges/corners.
 HIGHRES_DOWNLOAD_MARGIN = 1.5
-METERS_PER_DEGREE_LATITUDE = 111_320.0
 
 
 def _lowres_files_present(sample_dir: Path, expected_count: int, lowres_key: str) -> bool:
@@ -82,15 +81,13 @@ def _clear_highres_order_id(sample_dir: Path, highres_key: str) -> None:
     _highres_order_checkpoint_file(sample_dir, highres_key).unlink(missing_ok=True)
 
 
-def _download_buffer_degrees(patch_size_meters: float, latitude: float, margin: float = HIGHRES_DOWNLOAD_MARGIN) -> float:
-    """Degrees of buffer needed around a point to cover a patch of *patch_size_meters*.
+def _download_buffer_meters(patch_size_meters: float, margin: float = HIGHRES_DOWNLOAD_MARGIN) -> float:
+    """Meters of buffer needed around a point to cover a patch of *patch_size_meters*.
 
-    Inflates by 1/cos(latitude) so the (latitude-shrunk) east-west extent of a
-    degree-based buffer still covers the patch footprint at high latitudes.
+    Used as a true geodesic radius for ee.Geometry.buffer(), which is
+    latitude-independent, so no longitude-compression correction is needed here.
     """
-    half_extent_m = (patch_size_meters / 2.0) * margin
-    longitude_scale = max(0.1, np.cos(np.radians(latitude)))
-    return half_extent_m / (METERS_PER_DEGREE_LATITUDE * longitude_scale)
+    return (patch_size_meters / 2.0) * margin
 
 
 def download_lowres_images(sample_metadata, sample_dir, logger, lowres_manager, count, lowres_key):
@@ -123,6 +120,12 @@ def download_lowres_images(sample_metadata, sample_dir, logger, lowres_manager, 
 
         lowres_dir = ensure_directory(sample_dir / lowres_key)
 
+        # Match the high-res target's ground footprint (not the satellite's generic
+        # SPEC default buffer) so low-res/high-res pairs are aligned, and so Sentinel-2's
+        # many bands don't blow past Earth Engine's 48MB synchronous download cap.
+        patch_size_meters = float(sample_metadata.get("patch_size_meters", DEFAULT_PATCH_SIZE_METERS))
+        buffer_meters = _download_buffer_meters(patch_size_meters)
+
         for index, img_info in enumerate(lowres_images):
             date_str = img_info.get("date", "unknown").split("T")[0]
             logger.info(f"Processing {lowres_key} image {index + 1}/{len(lowres_images)}")
@@ -138,6 +141,7 @@ def download_lowres_images(sample_metadata, sample_dir, logger, lowres_manager, 
                 sample_metadata["latitude"],
                 sample_metadata["longitude"],
                 output_file,
+                buffer_meters=buffer_meters,
             ):
                 logger.info(f"Downloaded {lowres_key} image {index}: {output_file.name}")
             else:
@@ -233,14 +237,14 @@ def download_highres_gee_image(sample_metadata, sample_dir, logger, highres_mana
         raw_file = raw_dir / f"{highres_key}_raw_{int(sample_metadata['location_id']):06d}.tif"
 
         patch_size_meters = float(sample_metadata.get("patch_size_meters", DEFAULT_PATCH_SIZE_METERS))
-        buffer_degrees = _download_buffer_degrees(patch_size_meters, sample_metadata["latitude"])
+        buffer_meters = _download_buffer_meters(patch_size_meters)
 
         if not highres_manager.download_image(
             image,
             sample_metadata["latitude"],
             sample_metadata["longitude"],
             raw_file,
-            buffer_degrees=buffer_degrees,
+            buffer_meters=buffer_meters,
         ):
             return False
 
