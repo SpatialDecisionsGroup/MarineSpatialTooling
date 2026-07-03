@@ -18,10 +18,15 @@ dependencies = [
   "requests",
   "earthengine-api",
   "planet",
+  "xarray>=2026.4.0",
+  "matplotlib>=3.11.0",
+  "seaborn>=0.13.2",
+  "scipy>=1.17.1",
 ]
 
 [project.scripts]
 superres = "superres.entry:main"
+analyse-dataset = "superres.analyse_dataset:main"
 seagrass = "seagrass.entry:main"
 setup-sr-credentials = "setup_credentials:main"
 

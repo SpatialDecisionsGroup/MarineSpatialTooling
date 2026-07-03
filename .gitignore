@@ -5,6 +5,8 @@ sr_dataset.egg-info/
 *.log
 *.csv
 *.json
+/figures
+*.tif
 
 # Python
 __pycache__
