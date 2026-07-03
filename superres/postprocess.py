@@ -232,7 +232,7 @@ def postprocess_dataset():
         description="Align low-res image stacks to the high-res grid and rescale all rasters to surface reflectance"
     )
     parser.add_argument("data_dir", help="Path to dataset data directory (contains sample_* folders)")
-    parser.add_argument("-o", "--output", default="./superres/processed", help="Output directory for postprocessed rasters")
+    parser.add_argument("-o", "--output", default=None, help="Output directory for postprocessed rasters (default: <data_dir>/../processed)")
     parser.add_argument("--overwrite", action="store_true", help="Reprocess samples even if output files already exist")
     args = parser.parse_args()
 
@@ -241,7 +241,7 @@ def postprocess_dataset():
         print(f"Error: Data directory not found: {data_dir}")
         exit(1)
 
-    output_dir = ensure_directory(Path(args.output))
+    output_dir = ensure_directory(Path(args.output) if args.output else data_dir.parent / "processed")
     logger = setup_logger("PostprocessDataset", output_dir / "postprocess.log")
     logger.info(f"Starting postprocessing from {data_dir}")
 

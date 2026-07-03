@@ -147,7 +147,7 @@ class GEESatelliteManager:
                     ee.Filter.lte("NODATA_PIXEL_PERCENTAGE", self.SPEC.max_nodata_pct)
                 )
 
-            collection = collection.sort("system:time_start").limit(max_images)
+            collection = collection.sort(self.SPEC.cloud_cover_property).limit(max_images)
 
             images_info = collection.toList(max_images).getInfo()
 

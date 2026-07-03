@@ -5,6 +5,7 @@ Multi-image super-resolution dataset creator for global water patches.
 from __future__ import annotations
 
 import logging
+import random
 import shutil
 from collections import deque
 from datetime import date, timedelta
@@ -36,6 +37,7 @@ from .world_sampling import SampleTarget, WorldPatchSampler
 
 HIGHRES_SEARCH_START = "2016-01-01"
 HIGHRES_SEARCH_END = date.today().isoformat()
+HIGHRES_CANDIDATES = 30  # S2 pool size: fetch this many low-cloud candidates before picking one
 
 
 def _season_id_from_month(month: int) -> int:
@@ -98,15 +100,22 @@ def _find_matching_target(
 
 
 def _sort_by_quality(images: List[Dict]) -> List[Dict]:
-    """Sort image candidates best-first (lowest cloud cover, then earliest date)."""
+    """Sort image candidates best-first (lowest cloud cover; ties broken randomly).
+
+    Randomising ties prevents the date from acting as a tiebreaker, which would
+    otherwise systematically favour the earliest archive year (2016) whenever
+    several images share the same cloud-cover percentage.
+    """
     def sort_key(image):
         try:
             cloud_cover = float(image.get("cloud_cover", 100) or 100)
         except (TypeError, ValueError):
             cloud_cover = 100.0
-        return (cloud_cover, str(image.get("date", "")))
+        return cloud_cover
 
-    return sorted(images, key=sort_key)
+    shuffled = list(images)
+    random.shuffle(shuffled)
+    return sorted(shuffled, key=sort_key)
 
 
 def _build_highres_identifier_fields(highres_manager, highres_image: Dict, aoi_geojson: Dict) -> Dict:
@@ -319,7 +328,7 @@ def create_dataset():
                     candidate["longitude"],
                     HIGHRES_SEARCH_START,
                     HIGHRES_SEARCH_END,
-                    8,
+                    HIGHRES_CANDIDATES,
                 )
             )
             highres_seconds = perf_counter() - highres_start
