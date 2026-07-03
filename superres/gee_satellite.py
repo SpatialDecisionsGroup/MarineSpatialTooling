@@ -36,6 +36,12 @@ class GEESatelliteSpec:
     green_band: str = ""
     resolution_meters: float = 10.0
     download_buffer_meters: float = 5566.0
+    # Data-coverage quality filters applied in retrieve_images() alongside the
+    # cloud-cover filter, to reject scenes with fill/nodata at the patch location.
+    # filterBounds() finds scenes that intersect the AOI but the specific patch
+    # can still land in a fill region (Landsat swath gaps, partial S2 granules).
+    min_data_coverage_pct: Optional[float] = None   # e.g. DATA_COVERAGE_PERCENT >= 90
+    max_nodata_pct: Optional[float] = None          # e.g. NODATA_PIXEL_PERCENTAGE <= 5
 
 
 class GEESatelliteManager:
@@ -130,9 +136,18 @@ class GEESatelliteManager:
             collection = self._collection() \
                 .filterBounds(search_geometry) \
                 .filterDate(date_start, date_end) \
-                .filter(ee.Filter.lt(self.SPEC.cloud_cover_property, MAX_CLOUD_COVER)) \
-                .sort("system:time_start") \
-                .limit(max_images)
+                .filter(ee.Filter.lt(self.SPEC.cloud_cover_property, MAX_CLOUD_COVER))
+
+            if self.SPEC.min_data_coverage_pct is not None:
+                collection = collection.filter(
+                    ee.Filter.gte("DATA_COVERAGE_PERCENT", self.SPEC.min_data_coverage_pct)
+                )
+            if self.SPEC.max_nodata_pct is not None:
+                collection = collection.filter(
+                    ee.Filter.lte("NODATA_PIXEL_PERCENTAGE", self.SPEC.max_nodata_pct)
+                )
+
+            collection = collection.sort("system:time_start").limit(max_images)
 
             images_info = collection.toList(max_images).getInfo()
 

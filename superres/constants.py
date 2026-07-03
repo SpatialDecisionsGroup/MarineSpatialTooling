@@ -36,6 +36,26 @@ PLANETSCOPE_BANDS = 8
 PLANETSCOPE_ITEM_TYPE = "PSScene"
 PLANETSCOPE_PRODUCT_BUNDLE = "analytic_8b_sr_udm2"
 PLANETSCOPE_ORDERS_URL = "https://api.planet.com/compute/ops/orders/v2"
+# The "harmonize: target_sensor: Sentinel-2" order tool (see planetscope.py's
+# build_order_request) calibrates PlanetScope's 8-band analytic SR product onto
+# Sentinel-2's response, so it shares Sentinel-2's reflectance x10000 scaling.
+PLANETSCOPE_REFLECTANCE_SCALE = 0.0001
+
+# Surface-reflectance scale/offset per band name: reflectance = dn * scale + offset.
+# Source: Sentinel-2 SR (COPERNICUS/S2_SR_HARMONIZED) and Landsat C2 L2 SR docs.
+# Bands not listed here (e.g. SCL, QA_PIXEL) are classification/QA masks, not
+# reflectance, and are left unscaled by postprocess.py.
+REFLECTANCE_SCALE_OFFSET = {
+    # Sentinel-2 optical bands (B1-B12, B8A) and PlanetScope's harmonized bands.
+    "B1": (0.0001, 0.0), "B2": (0.0001, 0.0), "B3": (0.0001, 0.0), "B4": (0.0001, 0.0),
+    "B5": (0.0001, 0.0), "B6": (0.0001, 0.0), "B7": (0.0001, 0.0), "B8": (0.0001, 0.0),
+    "B8A": (0.0001, 0.0), "B11": (0.0001, 0.0), "B12": (0.0001, 0.0),
+    "AOT": (0.001, 0.0),
+    # Landsat Collection 2 Level-2 surface reflectance optical bands.
+    "SR_B1": (0.0000275, -0.2), "SR_B2": (0.0000275, -0.2), "SR_B3": (0.0000275, -0.2),
+    "SR_B4": (0.0000275, -0.2), "SR_B5": (0.0000275, -0.2), "SR_B6": (0.0000275, -0.2),
+    "SR_B7": (0.0000275, -0.2),
+}
 
 # Dataset configuration
 LOWRES_MIN_IMAGES = 6  # Minimum low-res images per sample (reject if fewer)

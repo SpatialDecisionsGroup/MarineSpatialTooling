@@ -24,4 +24,5 @@ class Sentinel2Manager(GEESatelliteManager):
         red_band=SENTINEL2_RED_BAND,
         green_band=SENTINEL2_GREEN_BAND,
         resolution_meters=SENTINEL2_RESOLUTION,
+        max_nodata_pct=5.0,
     )
