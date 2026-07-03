@@ -90,6 +90,19 @@ def _download_buffer_meters(patch_size_meters: float, margin: float = HIGHRES_DO
     return (patch_size_meters / 2.0) * margin
 
 
+def _raster_is_empty(path: Path) -> bool:
+    """Return True if band 1 of *path* is entirely zero or equal to the nodata value."""
+    try:
+        with rasterio.open(path) as src:
+            data = src.read(1)
+            nodata = src.nodata
+            if nodata is not None:
+                return bool(np.all(data == nodata))
+            return bool(np.all(data == 0))
+    except Exception:
+        return True
+
+
 def download_lowres_images(sample_metadata, sample_dir, logger, lowres_manager, count, lowres_key):
     """Download the low-resolution multi-image stack for a sample."""
     try:
@@ -136,17 +149,28 @@ def download_lowres_images(sample_metadata, sample_dir, logger, lowres_manager, 
                 continue
 
             output_file = lowres_dir / f"{lowres_key}_{index:02d}_{date_str}.tif"
-            if lowres_manager.download_image(
+            if not lowres_manager.download_image(
                 image,
                 sample_metadata["latitude"],
                 sample_metadata["longitude"],
                 output_file,
                 buffer_meters=buffer_meters,
             ):
-                logger.info(f"Downloaded {lowres_key} image {index}: {output_file.name}")
-            else:
                 logger.error(f"Failed to download {lowres_key} image {index}")
                 return False
+
+            # Reject scenes that downloaded successfully but contain only fill/zero
+            # pixels (e.g. Landsat swath gaps, partial S2 granules that intersect
+            # the AOI but don't actually cover the patch location).
+            if _raster_is_empty(output_file):
+                logger.warning(
+                    f"{lowres_key} image {index} ({output_file.name}) is all-zero — "
+                    f"fill data at this location; rejecting sample so it can be retried"
+                )
+                output_file.unlink(missing_ok=True)
+                return False
+
+            logger.info(f"Downloaded {lowres_key} image {index}: {output_file.name}")
 
         return True
 
@@ -246,6 +270,14 @@ def download_highres_gee_image(sample_metadata, sample_dir, logger, highres_mana
             raw_file,
             buffer_meters=buffer_meters,
         ):
+            return False
+
+        if _raster_is_empty(raw_file):
+            logger.warning(
+                f"High-res raw download for {asset_id} is all-zero — "
+                f"fill data at this location; rejecting sample"
+            )
+            raw_file.unlink(missing_ok=True)
             return False
 
         standardized_file = _highres_standardized_file(sample_dir, sample_metadata["location_id"], highres_key)
