@@ -8,9 +8,7 @@ figure for the group.  Naming convention: <group><panel>_<description>.png
   01b  spatial_depth                world map, depth class
   01c  spatial_turbidity            world map, turbidity class
   01   spatial_distribution         combined 1×3
-  02a  depth_turbidity_kde          joint KDE scatter (log-turbidity y-axis)
-  02b  depth_turbidity_hist         2-D histogram
-  02   depth_turbidity_density      combined 1×2
+  02   depth_turbidity_density      2-D histogram, estuary/offshore overlaid
   03a  reflectance_landsat          per-band violin, Landsat only
   03b  reflectance_sentinel2        per-band violin, Sentinel-2 only
   03_panels  reflectance_panels     Landsat + S2 side-by-side subplots (1×2)
@@ -39,6 +37,9 @@ figure for the group.  Naming convention: <group><panel>_<description>.png
   10b  alignment_magnitude          shift magnitude histogram
   10c  alignment_cdf                shift magnitude CDF
   10   alignment_quality            combined 1×3
+  11a  thumbnails_random            random LR/HR RGB pairs
+  11b  thumbnails_bad_alignment     worst phase-correlation shift pairs
+  11c  thumbnails_clipping          worst Landsat saturation pairs
 
 Usage
 -----
@@ -221,13 +222,15 @@ def _sample_reflectance(
                     if nodata is not None:
                         data[data == nodata] = np.nan
                     valid = data[np.isfinite(data)]
-                    valid = np.clip(valid, 0.0, 1.0)
                     if valid.size == 0:
                         continue
+                    clip_frac = float((valid >= 1.0).mean())
+                    valid = np.clip(valid, 0.0, 1.0)
                     records.append({
                         "location_id": loc_id,
                         "band": bname,
                         "reflectance": float(np.mean(valid)),
+                        "clip_frac": clip_frac,
                         "environment_class": row["environment_class"],
                         "depth_class": row["depth_class"],
                         "turbidity_class": row["turbidity_class"],
@@ -242,15 +245,19 @@ def _sample_reflectance(
 
 def _radial_psd(patch: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """
-    2D FFT → radial-averaged power spectral density.
+    2D FFT → radial-averaged power spectral density, normalised by pixel count.
+
+    Dividing by h*w gives power-per-pixel units so that a bicubically
+    upsampled image (which has scale_factor^2 more pixels but no new
+    high-frequency content) starts near the native LR curve at low frequencies.
 
     Returns (frequencies, psd) where frequencies are in units of
     cycles per pixel (0 to 0.5 Nyquist).
     """
     win = np.hanning(patch.shape[0])[:, None] * np.hanning(patch.shape[1])[None, :]
     f = np.fft.fftshift(np.fft.fft2(patch * win))
-    power = np.abs(f) ** 2
-    h, w = power.shape
+    h, w = patch.shape
+    power = np.abs(f) ** 2 / (h * w)
     cy, cx = h // 2, w // 2
     y, x = np.ogrid[:h, :w]
     r = np.hypot(x - cx, y - cy).astype(int)
@@ -329,30 +336,32 @@ def _set_log_yaxis(ax):
         ax.axhline(np.log10(thresh), color=color, lw=1.0, ls="--", alpha=0.8)
 
 
-def _draw_depth_turb_kde(ax, valid):
-    for env, color in ENV_PALETTE.items():
-        sub = valid[valid["environment_class"] == env]
-        ax.scatter(sub["depth_m"], np.log10(sub["turbidity_index"]),
-                   c=color, s=5, alpha=0.35, linewidths=0, label=env)
-    for thresh, color, label in [(0.03, "#FFA726", "clear|moderate"),
-                                  (0.08, "#E53935", "moderate|turbid")]:
-        ax.axhline(np.log10(thresh), color=color, lw=1.0, ls="--", alpha=0.8, label=label)
-    _set_log_yaxis(ax)
-    ax.set_xlabel("Depth (m)")
-    ax.set_title("Depth–turbidity scatter (by environment)", fontsize=10)
-    ax.legend(fontsize=8, markerscale=2)
-    ax.grid(True, linewidth=0.3, alpha=0.4)
-
 
 def _draw_depth_turb_hist(ax, valid):
     turb_vals = valid["turbidity_index"]
-    log_bins = np.linspace(np.log10(turb_vals.min()), np.log10(turb_vals.max()), 31)
-    h = ax.hist2d(valid["depth_m"], np.log10(turb_vals),
-                  bins=[30, log_bins], cmap="YlOrRd", norm=mcolors.LogNorm(vmin=1))
-    plt.colorbar(h[3], ax=ax, label="count (log scale)")
+    depth_bins = np.linspace(valid["depth_m"].min(), valid["depth_m"].max(), 31)
+    log_bins   = np.linspace(np.log10(turb_vals.min()), np.log10(turb_vals.max()), 31)
+
+    for env, hex_color in ENV_PALETTE.items():
+        sub = valid[valid["environment_class"] == env]
+        if sub.empty:
+            continue
+        counts, xedges, yedges = np.histogram2d(
+            sub["depth_m"], np.log10(sub["turbidity_index"]),
+            bins=[depth_bins, log_bins],
+        )
+        cmap = mcolors.LinearSegmentedColormap.from_list(
+            f"env_{env}", ["#ffffff00", hex_color], N=256,
+        )
+        norm = mcolors.LogNorm(vmin=1, vmax=max(counts.max(), 1))
+        masked = np.ma.masked_where(counts == 0, counts)
+        ax.pcolormesh(xedges, yedges, masked.T, cmap=cmap, norm=norm, alpha=0.75)
+
     _set_log_yaxis(ax)
     ax.set_xlabel("Depth (m)")
-    ax.set_title("Depth–turbidity 2-D histogram", fontsize=10)
+    ax.set_title("Depth–turbidity density (estuary / offshore)", fontsize=10)
+    handles = [plt.Rectangle((0, 0), 1, 1, color=c, label=e) for e, c in ENV_PALETTE.items()]
+    ax.legend(handles=handles, fontsize=8)
     ax.grid(True, linewidth=0.3, alpha=0.4)
 
 
@@ -360,18 +369,7 @@ def fig_depth_turbidity_density(df: pd.DataFrame, out_dir: Path):
     valid = df[df["turbidity_index"] > 0].copy()
 
     fig, ax = plt.subplots(figsize=(7, 5))
-    _draw_depth_turb_kde(ax, valid)
-    _savefig(fig, out_dir / "02a_depth_turbidity_kde.png")
-
-    fig, ax = plt.subplots(figsize=(7, 5))
     _draw_depth_turb_hist(ax, valid)
-    _savefig(fig, out_dir / "02b_depth_turbidity_hist.png")
-
-    fig, axes = plt.subplots(1, 2, figsize=(14, 5))
-    _draw_depth_turb_kde(axes[0], valid)
-    _draw_depth_turb_hist(axes[1], valid)
-    axes[1].set_ylabel("")
-    fig.suptitle("Depth and turbidity coverage", fontsize=12)
     _savefig(fig, out_dir / "02_depth_turbidity_density.png")
 
 
@@ -503,6 +501,30 @@ def fig_band_reflectance(ls_df: pd.DataFrame, s2_df: pd.DataFrame, out_dir: Path
     fig.suptitle("Per-band surface reflectance (patch-mean; LR nodata masked, "
                  "S2 cloud pixels clipped to [0,1])", fontsize=11)
     _savefig(fig, out_dir / "03_reflectance_panels.png")
+
+    # 03c – Landsat clipping rate per band
+    if not ls_df.empty and "clip_frac" in ls_df.columns:
+        clip_by_band = (
+            ls_df.groupby("band")["clip_frac"]
+            .agg(["mean", "max"])
+            .reindex(LANDSAT_SPECTRAL_BANDS)
+            .dropna()
+        )
+        fig, ax = plt.subplots(figsize=(8, 4))
+        xs = np.arange(len(clip_by_band))
+        labels = [LANDSAT_LABEL.get(b, b) for b in clip_by_band.index]
+        ax.bar(xs, clip_by_band["mean"] * 100, color=LR_COLOR, alpha=0.85,
+               label="mean clip %")
+        ax.bar(xs, clip_by_band["max"] * 100, color=LR_COLOR, alpha=0.3,
+               label="max clip %")
+        ax.axhline(5, color="#E53935", ls="--", lw=1.0, label="5% flag threshold")
+        ax.set_xticks(xs); ax.set_xticklabels(labels, fontsize=8)
+        ax.set_ylabel("Pixels with reflectance ≥ 1.0 (%)")
+        ax.set_title("Landsat saturation (clipping) rate per band\n"
+                     "(dark = mean across samples; light = worst sample)", fontsize=10)
+        ax.legend(fontsize=8)
+        ax.grid(True, linewidth=0.3, alpha=0.4, axis="y")
+        _savefig(fig, out_dir / "03c_clipping_rate.png")
 
 
 # ── 04 Spectral difficulty ────────────────────────────────────────────────────
@@ -856,7 +878,7 @@ def fig_psd_curves(processed_dir: Path, df: pd.DataFrame, n_samples: int, out_di
     ax.axvline(lr_nyquist, color=LR_COLOR, ls=":", lw=1.2, alpha=0.8,
                label=f"LR Nyquist ({lr_nyquist:.1f} cyc/km)")
     ax.set_xlabel("Spatial frequency (cycles / km)", fontsize=11)
-    ax.set_ylabel("Power spectral density (log)", fontsize=11)
+    ax.set_ylabel("Power spectral density (per pixel, log)", fontsize=11)
     ax.set_title("Radial-averaged PSD: LR, HR, and bicubically upsampled LR\n"
                  "(band 4 / red; mean ± 1 SD across samples)", fontsize=10)
     ax.legend(fontsize=9)
@@ -866,7 +888,7 @@ def fig_psd_curves(processed_dir: Path, df: pd.DataFrame, n_samples: int, out_di
 
 # ── 09 LR/HR paired histograms ────────────────────────────────────────────────
 
-def _draw_lr_hr_hist(ax, lr_arr, hr_arr, ls_b, s2_b, label):
+def _draw_lr_hr_hist(ax, lr_arr, hr_arr, ls_b, s2_b, label, lr_clip_frac=0.0):
     bins = np.linspace(0, 1, 60)
     if lr_arr.size:
         ax.hist(lr_arr, bins=bins, color=LR_COLOR, alpha=0.6, density=True,
@@ -874,6 +896,12 @@ def _draw_lr_hr_hist(ax, lr_arr, hr_arr, ls_b, s2_b, label):
     if hr_arr.size:
         ax.hist(hr_arr, bins=bins, color=HR_COLOR, alpha=0.6, density=True,
                 label=f"HR  {s2_b} (Sentinel-2)", edgecolor="none")
+    if lr_clip_frac > 0:
+        ax.axvline(1.0, color="#E53935", ls="--", lw=1.0)
+        ax.text(0.99, 0.97, f"LR clipped ≥1.0:\n{lr_clip_frac:.1%}",
+                transform=ax.transAxes, ha="right", va="top",
+                fontsize=7, color="#E53935",
+                bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#E53935", alpha=0.8))
     ax.set_xlabel("Surface reflectance"); ax.set_ylabel("Density")
     ax.set_title(f"LR vs HR pixel intensity – {label}", fontsize=10)
     ax.legend(fontsize=8)
@@ -889,8 +917,9 @@ def fig_lr_hr_histograms(processed_dir: Path, df: pd.DataFrame, n_samples: int, 
     hr_band_idx = {s2_b: S2_SPECTRAL_BANDS.index(s2_b) + 1
                    for _, s2_b, _ in COMPARABLE_PAIRS if s2_b in S2_SPECTRAL_BANDS}
 
-    ls_pixels: dict[str, list] = {b: [] for b, _, _ in COMPARABLE_PAIRS}
-    s2_pixels: dict[str, list] = {s: [] for _, s, _ in COMPARABLE_PAIRS}
+    ls_pixels: dict[str, list]      = {b: [] for b, _, _ in COMPARABLE_PAIRS}
+    ls_clip_counts: dict[str, list] = {b: [] for b, _, _ in COMPARABLE_PAIRS}
+    s2_pixels: dict[str, list]      = {s: [] for _, s, _ in COMPARABLE_PAIRS}
 
     rows = df.sample(n=min(n_samples, len(df)), random_state=13)
     cap = max(1, 50_000 // n_samples)
@@ -910,7 +939,9 @@ def fig_lr_hr_histograms(processed_dir: Path, df: pd.DataFrame, n_samples: int, 
                         d = src.read(bidx).astype(np.float32).ravel()
                         if src.nodata is not None:
                             d = d[d != src.nodata]
-                        d = np.clip(d[np.isfinite(d)], 0, 1)
+                        d = d[np.isfinite(d)]
+                        ls_clip_counts[ls_b].append(float((d >= 1.0).mean()) if d.size else 0.0)
+                        d = np.clip(d, 0, 1)
                         ls_pixels[ls_b].extend(d[:cap].tolist())
             with rasterio.open(hr_files[0]) as src:
                 for _, s2_b, _ in COMPARABLE_PAIRS:
@@ -925,19 +956,22 @@ def fig_lr_hr_histograms(processed_dir: Path, df: pd.DataFrame, n_samples: int, 
             continue
 
     letters = "abcdefg"
+    clip_fracs = {ls_b: float(np.mean(ls_clip_counts[ls_b])) if ls_clip_counts[ls_b] else 0.0
+                  for ls_b, _, _ in COMPARABLE_PAIRS}
     pair_arrays = [(np.array(ls_pixels[ls_b]), np.array(s2_pixels[s2_b]), ls_b, s2_b, label)
                    for ls_b, s2_b, label in COMPARABLE_PAIRS]
 
     for i, (lr_arr, hr_arr, ls_b, s2_b, label) in enumerate(pair_arrays):
         fig, ax = plt.subplots(figsize=(6, 4))
-        _draw_lr_hr_hist(ax, lr_arr, hr_arr, ls_b, s2_b, label)
+        _draw_lr_hr_hist(ax, lr_arr, hr_arr, ls_b, s2_b, label, lr_clip_frac=clip_fracs[ls_b])
         fname = f"09{letters[i]}_lr_hr_hist_{label.replace(' ', '').replace('~', '')}.png"
         _savefig(fig, out_dir / fname)
 
     fig, axes = plt.subplots(2, 4, figsize=(24, 8))
     for i, (lr_arr, hr_arr, ls_b, s2_b, label) in enumerate(pair_arrays):
         row, col = divmod(i, 4)
-        _draw_lr_hr_hist(axes[row, col], lr_arr, hr_arr, ls_b, s2_b, label)
+        _draw_lr_hr_hist(axes[row, col], lr_arr, hr_arr, ls_b, s2_b, label,
+                         lr_clip_frac=clip_fracs[ls_b])
     axes[1, 3].set_visible(False)
     for row_axes in axes:
         for ax in row_axes[1:]:
@@ -956,10 +990,16 @@ def _draw_align_scatter(ax, sx, sy, stats):
     ax.grid(True, linewidth=0.3, alpha=0.4)
 
 
+_ALIGN_THRESHOLD_PX = 3   # flag threshold used in check_dataset
+
+
 def _draw_align_magnitude(ax, mag):
     ax.hist(mag, bins=40, color="#546E7A", alpha=0.85, edgecolor="none")
-    ax.axvline(np.median(mag), color="k", ls="--", lw=1.2,
-               label=f"median {np.median(mag):.2f} px")
+    med = np.median(mag)
+    ax.axvline(med, color="k", ls="--", lw=1.2, label=f"median {med:.2f} px")
+    bad_frac = (mag > _ALIGN_THRESHOLD_PX).mean() * 100
+    ax.axvline(_ALIGN_THRESHOLD_PX, color="#E53935", ls="--", lw=1.2,
+               label=f">{_ALIGN_THRESHOLD_PX} px: {bad_frac:.1f}% of samples")
     ax.set_xlabel("Shift magnitude (HR pixels)"); ax.set_ylabel("Count")
     ax.set_title("Registration shift magnitude", fontsize=10)
     ax.legend(fontsize=8); ax.grid(True, linewidth=0.3, alpha=0.4, axis="y")
@@ -969,11 +1009,11 @@ def _draw_align_cdf(ax, mag):
     sorted_mag = np.sort(mag)
     cdf = np.arange(1, len(sorted_mag) + 1) / len(sorted_mag)
     ax.plot(sorted_mag, cdf * 100, color="#546E7A", lw=2)
-    for threshold in [0.5, 1.0, 2.0]:
+    for threshold, color in [(1.0, "gray"), (_ALIGN_THRESHOLD_PX, "#E53935"), (10.0, "#B71C1C")]:
         frac = (mag <= threshold).mean() * 100
-        ax.axvline(threshold, color="gray", ls=":", lw=0.8)
+        ax.axvline(threshold, color=color, ls=":", lw=0.9)
         ax.text(threshold + 0.03, frac - 3, f"{frac:.0f}%\n≤{threshold}px",
-                fontsize=7, va="top")
+                fontsize=7, va="top", color=color)
     ax.set_xlabel("Shift magnitude (HR pixels)"); ax.set_ylabel("Cumulative %")
     ax.set_title("Registration shift – CDF", fontsize=10)
     ax.grid(True, linewidth=0.3, alpha=0.4); ax.set_ylim(0, 105)
@@ -986,7 +1026,7 @@ def fig_alignment_quality(processed_dir: Path, df: pd.DataFrame, n_samples: int,
     """
     import rasterio
 
-    shifts_x, shifts_y = [], []
+    shifts_x, shifts_y, shift_ids = [], [], []
     rows = df.sample(n=min(n_samples, len(df)), random_state=99)
 
     for _, row in tqdm(rows.iterrows(), total=len(rows), desc="  alignment", leave=False):
@@ -1020,9 +1060,7 @@ def fig_alignment_quality(processed_dir: Path, df: pd.DataFrame, n_samples: int,
         h, w = corr.shape
         peak = np.unravel_index(corr.argmax(), corr.shape)
         dy, dx = peak[0] - h // 2, peak[1] - w // 2
-        if abs(dy) > h // 4 or abs(dx) > w // 4:
-            continue
-        shifts_x.append(float(dx)); shifts_y.append(float(dy))
+        shifts_x.append(float(dx)); shifts_y.append(float(dy)); shift_ids.append(loc_id)
 
     if not shifts_x:
         print("  (skipping alignment – no valid pairs)")
@@ -1030,9 +1068,10 @@ def fig_alignment_quality(processed_dir: Path, df: pd.DataFrame, n_samples: int,
 
     sx, sy = np.array(shifts_x), np.array(shifts_y)
     mag = np.hypot(sx, sy)
-    stats = (f"n={len(sx)}  mean={mag.mean():.2f} px  "
-             f"median={np.median(mag):.2f} px  p95={np.percentile(mag, 95):.2f} px  "
-             f"(1 HR pixel = 10 m)")
+    bad_frac = (mag > _ALIGN_THRESHOLD_PX).mean() * 100
+    stats = (f"n={len(sx)}  median={np.median(mag):.2f} px  "
+             f"p95={np.percentile(mag, 95):.2f} px  "
+             f">{_ALIGN_THRESHOLD_PX} px: {bad_frac:.1f}%  (1 HR px = 10 m)")
 
     fig, ax = plt.subplots(figsize=(5, 5))
     _draw_align_scatter(ax, sx, sy, stats)
@@ -1055,6 +1094,179 @@ def fig_alignment_quality(processed_dir: Path, df: pd.DataFrame, n_samples: int,
     fig.suptitle("Registration alignment quality", fontsize=12)
     _savefig(fig, out_dir / "10_alignment_quality.png")
 
+    shifts_json = out_dir / "10_alignment_shifts.json"
+    import json as _json
+    shifts_json.write_text(_json.dumps(
+        [{"location_id": lid, "shift_x": dx, "shift_y": dy,
+          "shift_magnitude_px": round(float(np.hypot(dx, dy)), 3)}
+         for lid, dx, dy in zip(shift_ids, sx.tolist(), sy.tolist())],
+        indent=2,
+    ))
+    print(f"  shifts written → {shifts_json.name}")
+
+
+# ── 11 Sample thumbnails ─────────────────────────────────────────────────────
+
+# 1-based rasterio band indices for R / G / B
+_LR_RGB = (4, 3, 2)   # Landsat: SR_B4 / SR_B3 / SR_B2
+_HR_RGB = (4, 3, 2)   # Sentinel-2: B4 / B3 / B2
+
+
+def _load_rgb(sat_dir: Path, r: int, g: int, b: int) -> "np.ndarray | None":
+    """Read three bands, apply 2–98th-percentile stretch, return (H,W,3) uint8 or None."""
+    import rasterio as _rio
+    files = sorted(sat_dir.glob("*.tif"))
+    if not files:
+        return None
+    try:
+        with _rio.open(files[0]) as src:
+            if src.count < max(r, g, b):
+                return None
+            bands = np.stack([src.read(i).astype(np.float32) for i in (r, g, b)], axis=-1)
+    except Exception:
+        return None
+    finite = np.isfinite(bands)
+    for c in range(3):
+        ch = bands[:, :, c]
+        valid = ch[finite[:, :, c]]
+        if valid.size >= 2:
+            lo, hi = np.percentile(valid, 2), np.percentile(valid, 98)
+            if hi > lo:
+                bands[:, :, c] = (ch - lo) / (hi - lo)
+    bands[~finite] = 0
+    return (np.clip(bands, 0, 1) * 255).astype(np.uint8)
+
+
+def _render_sample_row(axes, processed_dir: Path, loc_id: int, tag: str, meta: dict):
+    """Fill a 2-element axes row with LR and HR RGB for one sample."""
+    sample = f"sample_{loc_id:06d}"
+    lr_rgb = _load_rgb(processed_dir / sample / "landsat",   *_LR_RGB)
+    hr_rgb = _load_rgb(processed_dir / sample / "sentinel2", *_HR_RGB)
+    env   = meta.get("environment_class", "?")
+    depth = meta.get("depth_class", "?")
+    turb  = meta.get("turbidity_class", "?")
+
+    for ax, rgb, sensor in zip(axes, [lr_rgb, hr_rgb], ["Landsat LR 30 m", "Sentinel-2 HR 10 m"]):
+        if rgb is not None:
+            ax.imshow(rgb)
+        else:
+            ax.set_facecolor("#222222")
+            ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                    transform=ax.transAxes, fontsize=8, color="white")
+        ax.axis("off")
+
+    # Overlay info text on the LR panel
+    info = f"#{loc_id}  {env} / {depth} / {turb}"
+    if tag:
+        info += f"\n{tag}"
+    axes[0].text(0.02, 0.98, info,
+                 transform=axes[0].transAxes, fontsize=6.5,
+                 va="top", ha="left", color="white",
+                 bbox=dict(boxstyle="round,pad=0.3", fc="black", alpha=0.55, ec="none"))
+    # Sensor labels as small overlaid text on each panel
+    for ax, label in zip(axes, ["Landsat LR 30 m", "Sentinel-2 HR 10 m"]):
+        ax.text(0.98, 0.02, label,
+                transform=ax.transAxes, fontsize=6, va="bottom", ha="right",
+                color="white",
+                bbox=dict(boxstyle="round,pad=0.2", fc="black", alpha=0.45, ec="none"))
+
+
+def _save_thumbnail_grid(
+    samples: list[dict],
+    processed_dir: Path,
+    df: pd.DataFrame,
+    path: Path,
+    suptitle: str,
+):
+    """Render a grid (one row per sample, LR | HR columns) and save to path."""
+    n = len(samples)
+    if n == 0:
+        return
+    fig, axes = plt.subplots(n, 2, figsize=(7, 3.0 * n),
+                             gridspec_kw={"wspace": 0.03, "hspace": 0.06})
+    if n == 1:
+        axes = axes[None, :]
+    meta_lookup = df.set_index("location_id").to_dict("index")
+    for i, s in enumerate(samples):
+        meta = meta_lookup.get(s["location_id"], {})
+        _render_sample_row(axes[i], processed_dir, s["location_id"], s.get("tag", ""), meta)
+    suptitle_height = 0.28 / (3.0 * n)   # fraction of figure height for title row
+    fig.subplots_adjust(top=1.0 - suptitle_height, bottom=0.0, left=0.0, right=1.0)
+    fig.suptitle(suptitle, fontsize=9, y=1.0 - suptitle_height * 0.15)
+    fig.patch.set_facecolor("black")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    _savefig(fig, path)
+
+
+def fig_sample_thumbnails(
+    processed_dir: Path,
+    df: pd.DataFrame,
+    out_dir: Path,
+    n_random: int = 9,
+    n_interesting: int = 6,
+    ls_df: "pd.DataFrame | None" = None,
+    alignment_json: "Path | None" = None,
+):
+    """Save RGB thumbnail grids (LR | HR) to out_dir/thumbnails/.
+
+    Three grids are produced:
+      11a  thumbnails_random.png       – random sample
+      11b  thumbnails_bad_alignment.png – worst phase-correlation shifts
+      11c  thumbnails_clipping.png      – worst Landsat saturation
+    """
+    thumb_dir = out_dir / "thumbnails"
+    thumb_dir.mkdir(exist_ok=True)
+
+    # ── random ────────────────────────────────────────────────────────────────
+    rng = np.random.default_rng(seed=77)
+    rand_ids = rng.choice(df["location_id"].values, size=min(n_random, len(df)),
+                          replace=False).tolist()
+    _save_thumbnail_grid(
+        [{"location_id": int(i), "tag": "random"} for i in rand_ids],
+        processed_dir, df,
+        thumb_dir / "11a_thumbnails_random.png",
+        "Random sample pairs (Landsat LR  |  Sentinel-2 HR)",
+    )
+
+    # ── bad alignment ─────────────────────────────────────────────────────────
+    if alignment_json and alignment_json.exists():
+        import json as _json
+        shifts = _json.loads(alignment_json.read_text())
+        shifts.sort(key=lambda x: x["shift_magnitude_px"], reverse=True)
+        bad_align = [
+            {"location_id": s["location_id"],
+             "tag": f"shift {s['shift_magnitude_px']:.0f} px = {s['shift_magnitude_px']*10:.0f} m"}
+            for s in shifts[:n_interesting]
+            if (processed_dir / f"sample_{s['location_id']:06d}").exists()
+        ]
+        if bad_align:
+            _save_thumbnail_grid(
+                bad_align, processed_dir, df,
+                thumb_dir / "11b_thumbnails_bad_alignment.png",
+                f"Worst alignment shifts (largest phase-correlation offset)",
+            )
+
+    # ── high clipping ─────────────────────────────────────────────────────────
+    if ls_df is not None and not ls_df.empty and "clip_frac" in ls_df.columns:
+        worst_clip = (
+            ls_df.groupby("location_id")["clip_frac"]
+            .max()
+            .nlargest(n_interesting)
+            .reset_index()
+        )
+        clip_samples = [
+            {"location_id": int(row["location_id"]),
+             "tag": f"max clip {row['clip_frac']:.1%}"}
+            for _, row in worst_clip.iterrows()
+            if (processed_dir / f"sample_{int(row['location_id']):06d}").exists()
+        ]
+        if clip_samples:
+            _save_thumbnail_grid(
+                clip_samples, processed_dir, df,
+                thumb_dir / "11c_thumbnails_clipping.png",
+                "Worst Landsat saturation (highest clip fraction across bands)",
+            )
+
 
 # ─── driver ──────────────────────────────────────────────────────────────────
 
@@ -1072,6 +1284,8 @@ def main():
                         help="Random samples for band / PSD / histogram analysis (default: 150)")
     parser.add_argument("--skip-rasters", action="store_true",
                         help="Skip all raster-based figures (figs 3–4, 8–10)")
+    parser.add_argument("--images", action="store_true",
+                        help="Only generate sample thumbnails (fig 11); skip all other figures")
     args = parser.parse_args()
 
     out_dir = Path(args.output)
@@ -1084,6 +1298,23 @@ def main():
 
     sns.set_theme(style="whitegrid", context="notebook", font_scale=0.95)
     warnings.filterwarnings("ignore", category=UserWarning)
+
+    if args.images:
+        print("[11] Sample thumbnails")
+        ls_df = pd.DataFrame()
+        if processed_dir.exists():
+            ls_df = _sample_reflectance(
+                processed_dir, df, "landsat",
+                LANDSAT_SPECTRAL_BANDS, list(range(1, len(LANDSAT_SPECTRAL_BANDS) + 1)),
+                args.n_band_samples,
+            )
+        fig_sample_thumbnails(
+            processed_dir, df, out_dir,
+            ls_df=ls_df if not ls_df.empty else None,
+            alignment_json=out_dir / "10_alignment_shifts.json",
+        )
+        print(f"\nDone. Thumbnails written to {out_dir / 'thumbnails'}/")
+        return
 
     print("[01] Spatial distribution map")
     fig_spatial_distribution(df, out_dir)
@@ -1131,8 +1362,15 @@ def main():
 
         print(f"[10] Alignment quality  ({args.n_band_samples} samples)")
         fig_alignment_quality(processed_dir, df, args.n_band_samples, out_dir)
+
+        print("[11] Sample thumbnails")
+        fig_sample_thumbnails(
+            processed_dir, df, out_dir,
+            ls_df=ls_df if not ls_df.empty else None,
+            alignment_json=out_dir / "10_alignment_shifts.json",
+        )
     else:
-        print("[08–10] Raster figures skipped")
+        print("[08–11] Raster figures skipped")
 
     print(f"\nDone. Figures written to {out_dir}/")
 

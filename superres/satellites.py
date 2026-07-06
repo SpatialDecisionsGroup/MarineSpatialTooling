@@ -13,9 +13,9 @@ from __future__ import annotations
 
 from typing import Dict, Type, Union
 
-from .landsat import LandsatManager
+from common.landsat import LandsatManager
+from common.sentinel2 import Sentinel2Manager
 from .planetscope import PlanetScopeManager
-from .sentinel2 import Sentinel2Manager
 
 ManagerClass = Type[Union[Sentinel2Manager, LandsatManager, PlanetScopeManager]]
 

@@ -181,7 +181,7 @@ def config_create():
     parser.add_argument("--turbidity-file", default="./data/turbidity.nc", help="Path to turbidity raster (.nc or GeoTIFF) to use instead of API calls")
     parser.add_argument("--include-ecoregions", help="Comma-separated province names to include (prioritized). Use 'indonesia' for Indonesia regions.")
     parser.add_argument("--exclude-ecoregions", help="Comma-separated province names to exclude")
-    parser.add_argument("--resume", action="store_true", help="Resume from an existing dataset_metadata.json in the output directory")
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True, help="Resume from an existing dataset_metadata.json (default: on; use --no-resume to start fresh)")
     parser.add_argument(
         "--check",
         action="store_true",
@@ -264,7 +264,7 @@ def config_download():
         help="Output directory (defaults to the manifest's dataset directory, e.g. "
              "dataset/metadata/manifest.csv -> dataset/, so data lands in dataset/data/)",
     )
-    parser.add_argument("--resume", action="store_true", help="Skip samples that already have sample_metadata.json in the output directory")
+    parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True, help="Skip samples that already have sample_metadata.json (default: on; use --no-resume to start fresh)")
     parser.add_argument("--turbidity-file", default="./data/turbidity.nc", help="Path to turbidity raster (.nc or GeoTIFF) to use instead of API calls")
     parser.add_argument(
         "--lowres-satellite",

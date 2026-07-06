@@ -25,7 +25,7 @@ from .constants import (
     DEFAULT_PATCH_SIZE_METERS,
     PATCH_SIZE_PIXELS,
 )
-from .gee_satellite import GEESatelliteManager
+from common.gee_satellite import GEESatelliteManager
 from .satellites import (
     DEFAULT_HIGHRES_SATELLITE,
     DEFAULT_LOWRES_SATELLITE,

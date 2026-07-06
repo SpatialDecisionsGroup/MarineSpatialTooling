@@ -44,6 +44,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import rasterio
+from scipy.ndimage import zoom as _zoom
 from tqdm import tqdm
 
 from .constants import (
@@ -149,6 +150,8 @@ class CheckReport:
             "hr_pixel_size_mismatch":  "GEOREFERENCING",
             "hr_origin_mismatch":      "GEOREFERENCING",
             "all_nodata":              "VALUES",
+            "landsat_clipped":         "DATA QUALITY",
+            "large_shift":             "DATA QUALITY",
         }
         LABEL = {
             "missing_sample_dir":      "manifest location_id has no sample directory",
@@ -164,6 +167,8 @@ class CheckReport:
             "hr_pixel_size_mismatch":  "high-res pixel size inconsistent with patch metadata",
             "hr_origin_mismatch":      "high-res origin inconsistent with target_origin",
             "all_nodata":              "raster appears to contain only zero / nodata values",
+            "landsat_clipped":         f"Landsat band >{CLIP_FRAC_THRESHOLD:.0%} pixels saturated (reflectance ≥ 1.0)",
+            "large_shift":             f"LR–HR phase-correlation shift > {ALIGNMENT_SHIFT_THRESHOLD} HR pixels ({ALIGNMENT_SHIFT_THRESHOLD * 10} m)",
         }
 
         current_section = None
@@ -334,6 +339,98 @@ def check_sample(sample_dir: Path, report: CheckReport, check_values: bool = Tru
     src.close()
 
 
+# ─── data quality thresholds ─────────────────────────────────────────────────
+
+CLIP_FRAC_THRESHOLD      = 0.05   # flag if > 5% of reflectance pixels are ≥ 1.0
+ALIGNMENT_SHIFT_THRESHOLD = 3     # flag if phase-correlation shift > 3 HR pixels (30 m)
+
+
+def check_landsat_clipping(processed_sample_dir: Path, report: CheckReport, sample_name: str):
+    """Flag Landsat bands where >CLIP_FRAC_THRESHOLD of pixels are saturated (≥ 1.0).
+
+    Operates on postprocessed reflectance files (scale/offset already applied).
+    """
+    lr_dir = processed_sample_dir / "landsat"
+    if not lr_dir.exists():
+        return
+    for tif in sorted(lr_dir.glob("*.tif")):
+        try:
+            with rasterio.open(tif) as src:
+                for bidx in range(1, src.count + 1):
+                    data = src.read(bidx).astype(np.float32)
+                    nodata = src.nodata
+                    valid = data[np.isfinite(data)]
+                    if nodata is not None:
+                        valid = valid[valid != nodata]
+                    if valid.size == 0:
+                        continue
+                    clip_frac = float((valid >= 1.0).mean())
+                    if clip_frac > CLIP_FRAC_THRESHOLD:
+                        report.add(
+                            "landsat_clipped", sample_name,
+                            f"{tif.name} band {bidx}: {clip_frac:.1%} of pixels ≥ 1.0",
+                        )
+        except Exception as exc:
+            report.add("raster_open_failed", sample_name, f"{tif.name}: {exc}")
+
+
+def check_alignment_shift(
+    processed_sample_dir: Path,
+    report: CheckReport,
+    sample_name: str,
+    hr_band: int = 4,
+    lr_band: int = 4,
+):
+    """Flag samples whose LR–HR phase-correlation shift exceeds ALIGNMENT_SHIFT_THRESHOLD.
+
+    Uses the first Landsat and Sentinel-2 file found in the processed sample directory.
+    """
+    lr_dir  = processed_sample_dir / "landsat"
+    hr_dir  = processed_sample_dir / "sentinel2"
+    lr_files = sorted(lr_dir.glob("*.tif"))  if lr_dir.exists()  else []
+    hr_files = sorted(hr_dir.glob("*.tif"))  if hr_dir.exists()  else []
+    if not lr_files or not hr_files:
+        return
+    try:
+        with rasterio.open(lr_files[0]) as src:
+            bidx = min(lr_band, src.count)
+            lr_patch = src.read(bidx).astype(np.float32)
+        with rasterio.open(hr_files[0]) as src:
+            bidx = min(hr_band, src.count)
+            hr_patch = src.read(bidx).astype(np.float32)
+    except Exception:
+        return
+
+    if lr_patch.size == 0 or hr_patch.size == 0:
+        return
+    scale = hr_patch.shape[0] / lr_patch.shape[0]
+    bic = _zoom(lr_patch, scale, order=3)
+    bic = bic[:hr_patch.shape[0], :hr_patch.shape[1]]
+    if bic.shape != hr_patch.shape:
+        return
+
+    hr, bic = hr_patch.copy(), bic.copy()
+    for arr in (hr, bic):
+        arr -= arr.mean()
+        if arr.std() > 0:
+            arr /= arr.std()
+
+    cross = np.fft.fft2(hr) * np.conj(np.fft.fft2(bic))
+    corr  = np.abs(np.fft.ifft2(cross / (np.abs(cross) + 1e-12)))
+    corr  = np.fft.fftshift(corr)
+    h, w  = corr.shape
+    peak  = np.unravel_index(corr.argmax(), corr.shape)
+    dy, dx = peak[0] - h // 2, peak[1] - w // 2
+    mag   = float(np.hypot(dx, dy))
+
+    if mag > ALIGNMENT_SHIFT_THRESHOLD:
+        report.add(
+            "large_shift", sample_name,
+            f"shift ({dx:+.0f}, {dy:+.0f}) px → magnitude {mag:.1f} HR px "
+            f"= {mag * 10:.0f} m  (threshold {ALIGNMENT_SHIFT_THRESHOLD} px)",
+        )
+
+
 # ─── driver ─────────────────────────────────────────────────────────────────
 
 def check_dataset():
@@ -358,12 +455,36 @@ def check_dataset():
         "--no-values", action="store_true",
         help="Skip the all-zero/nodata value check (faster for large datasets)",
     )
+    parser.add_argument(
+        "--processed-dir", default=None,
+        help="Path to postprocessed reflectance files (default: <data_dir>/../processed). "
+             "Required for --check-clipping.",
+    )
+    parser.add_argument(
+        "--check-clipping", action="store_true",
+        help=f"Flag Landsat samples where >{CLIP_FRAC_THRESHOLD:.0%} of pixels in any band "
+             f"are saturated (reflectance ≥ 1.0). Requires --processed-dir.",
+    )
+    parser.add_argument(
+        "--check-alignment", action="store_true",
+        help=f"Flag samples whose LR–HR phase-correlation shift exceeds "
+             f"{ALIGNMENT_SHIFT_THRESHOLD} HR pixels ({ALIGNMENT_SHIFT_THRESHOLD * 10} m). "
+             f"Requires --processed-dir. Adds ~0.5 s per sample.",
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
     if not data_dir.exists():
         print(f"Error: data directory not found: {data_dir}")
         raise SystemExit(1)
+
+    processed_dir = (
+        Path(args.processed_dir) if args.processed_dir
+        else data_dir.parent / "processed"
+    )
+    run_quality = (args.check_clipping or args.check_alignment) and processed_dir.exists()
+    if (args.check_clipping or args.check_alignment) and not processed_dir.exists():
+        print(f"Warning: processed dir not found ({processed_dir}), skipping quality checks.")
 
     manifest_path = Path(args.manifest) if args.manifest else None
     report = CheckReport(data_dir=data_dir, manifest_path=manifest_path)
@@ -389,6 +510,13 @@ def check_dataset():
 
     for sample_dir in tqdm(sample_dirs, desc="Checking samples"):
         check_sample(sample_dir, report, check_values=not args.no_values)
+        if run_quality:
+            proc_sample = processed_dir / sample_dir.name
+            if proc_sample.exists():
+                if args.check_clipping:
+                    check_landsat_clipping(proc_sample, report, sample_dir.name)
+                if args.check_alignment:
+                    check_alignment_shift(proc_sample, report, sample_dir.name)
 
     # ── Output ────────────────────────────────────────────────────────────────
     report.print_summary(verbose=args.verbose)

@@ -4,12 +4,7 @@ A modular Python framework for creating and downloading multi-image super-resolu
 
 ## Table of Contents
 
-- [Project Structure](#project-structure)
-- [Modules](#modules)
-  - [Core Scripts](#core-scripts)
-  - [Configuration](#configuration)
-  - [Data Management](#data-management)
-  - [Satellite Data Modules](#satellite-data-modules)
+- [Dependencies](#dependencies)
 - [Workflow](#workflow)
   - [1. Setup Credentials](#1-setup-credentials)
   - [2. Create Dataset Manifest](#2-create-dataset-manifest)
@@ -21,88 +16,31 @@ A modular Python framework for creating and downloading multi-image super-resolu
   - [Growing the manifest](#growing-the-manifest-create)
   - [Incremental downloads](#incremental-downloads-download)
   - [Dropping bad samples](#dropping-bad-samples-drop_samplespy)
-- [Satellite Architecture](#satellite-architecture)
-- [Configuration Files](#configuration-files)
+- [Output Structure](#output-structure)
 - [Data Specifications](#data-specifications)
 - [Seasons](#seasons)
-- [Output Structure](#output-structure)
+- [Project Structure](#project-structure)
+- [Modules](#modules)
+  - [Core Scripts](#core-scripts)
+  - [Configuration](#configuration)
+  - [Data Management](#data-management)
+  - [Satellite Data Modules](#satellite-data-modules)
+- [Satellite Architecture](#satellite-architecture)
+- [Configuration Files](#configuration-files)
 - [Logging](#logging)
-- [Dependencies](#dependencies)
 
-## Project Structure
+## Dependencies
 
-```
-.
-├── setup_credentials.py           # Script to setup API credentials securely
-├── superres.py                    # CLI entry point: create / download / postprocess / tile / check subcommands
-├── seagrass.py                    # Example / project-specific script
-├── seagrass/                      # Project-specific seagrass analysis scripts
-│   ├── indonesia.py
-│   └── tampa_bay.py
-├── pyproject.toml                 # Project metadata and dependencies
-├── common/                        # Shared helper utilities
-│   ├── dataset_utils.py           # Shared utility functions (directories, logging, CRS helpers)
-│   ├── common.py                  # Label normalisation and dataframe helpers
-│   ├── credentials.py             # Credential loading helpers
-│   └── sentinel.py                # Shared Sentinel helpers
-└── superres/                      # Main package
-    ├── create_sr_dataset.py       # Main script to create dataset manifest
-    ├── download_and_preprocess.py # Script to download and preprocess data
-    ├── postprocess.py             # Align LR stack to HR grid and rescale to reflectance
-    ├── tile_dataset.py            # Script to tile downloaded rasters for training
-    ├── check_dataset.py           # Dataset integrity checker
-    ├── analyse_dataset.py         # Dataset analysis and figure generation
-    ├── drop_samples.py            # Remove samples from metadata and disk
-    ├── world_sampling.py          # Global water-patch sampling logic
-    ├── config.py                  # Configuration management
-    ├── constants.py               # Global constants and configuration values
-    ├── metadata.py                # Metadata storage and retrieval
-    ├── satellites.py              # Registry of LR/HR satellite managers
-    ├── gee_satellite.py           # Generic GEE satellite base class
-    ├── sentinel2.py               # Sentinel-2 data retrieval (GEE)
-    ├── landsat.py                 # Landsat 8/9 data retrieval (GEE)
-    ├── planetscope.py             # PlanetScope data retrieval (Planet Labs API)
-    ├── data/                      # Downloaded satellite data (created by download script)
-    ├── metadata/                  # Metadata files - JSON/CSV/logs (created by create script)
-    └── credentials/               # API credentials (created by setup_credentials.py)
-```
+Required packages:
 
-By default `-o`/`--output` is `./superres`, so the generated `data/`, `metadata/`, and
-`credentials/` directories sit alongside the package source under `superres/`. Pass a
-different `-o` to keep generated data separate from the code.
-
-## Modules
-
-### Core Scripts
-
-- **`superres.py`** - CLI entry point exposing `create`, `download`, `postprocess`, `tile`, and `check` subcommands
-- **`superres/create_sr_dataset.py`** - Creates the dataset by sampling locations proportionally from ecoregions and querying satellite imagery
-- **`superres/download_and_preprocess.py`** - Downloads satellite data and aligns the high-res raster to a standard grid
-- **`superres/postprocess.py`** - Reprojects the low-res image stack onto the high-res grid and rescales all rasters to surface reflectance
-- **`superres/tile_dataset.py`** - Tiles downloaded rasters into fixed-size training patches
-- **`superres/check_dataset.py`** - Validates every sample for structural integrity, raster dimensions, georeferencing, and non-zero values
-- **`superres/analyse_dataset.py`** - Generates a comprehensive set of analysis figures (spatial maps, spectral violins, temporal coverage, PSD curves, alignment diagnostics, etc.)
-- **`superres/drop_samples.py`** - Removes specific samples from metadata and disk so they can be regenerated
-- **`setup_credentials.py`** - Sets up API credentials securely in JSON format
-
-### Configuration
-
-- **`superres/config.py`** - `Config` class for managing dataset configuration and loading credentials
-- **`superres/constants.py`** - Global constants (resolutions, bands, seasons, etc.)
-
-### Data Management
-
-- **`superres/metadata.py`** - `DatasetMetadata` class for managing metadata storage (JSON and CSV)
-- **`superres/world_sampling.py`** - `WorldPatchSampler` for proposing globally-distributed water patch candidates
-
-### Satellite Data Modules
-
-- **`superres/satellites.py`** - Registry of satellite managers; defines `LOWRES_SATELLITES` (Sentinel-2, Landsat) and `HIGHRES_SATELLITES` (Sentinel-2, Landsat, PlanetScope)
-- **`superres/gee_satellite.py`** - `GEESatelliteManager` base class with shared GEE retrieval, turbidity estimation, and download logic
-- **`superres/sentinel2.py`** - `Sentinel2Manager` (subclasses `GEESatelliteManager`) for Sentinel-2 via Google Earth Engine
-- **`superres/landsat.py`** - `LandsatManager` (subclasses `GEESatelliteManager`) for Landsat 8/9 Collection 2 via Google Earth Engine
-- **`superres/planetscope.py`** - `PlanetScopeManager` for PlanetScope imagery via the Planet Labs Orders API
-- **`common/dataset_utils.py`** - Shared utilities (UTM CRS calculation, point sampling, season date ranges, directory/logging helpers)
+- `geopandas` - GIS vector data
+- `pandas` - Data manipulation
+- `numpy` - Numerical computing
+- `rasterio` - Raster data I/O
+- `shapely` - Geometric operations
+- `ee` - Google Earth Engine Python API
+- `planet` - Planet Labs SDK (optional, for PlanetScope download)
+- `tqdm` - Progress bars
 
 ## Workflow
 
@@ -119,6 +57,7 @@ Optional flags: `-o, --output-dir` (default `./superres/credentials`), `-p, --pl
 to pass the Planet API key non-interactively.
 
 The script will:
+
 1. Prompt for your Planet Labs API key (press Enter to skip or keep existing value)
 2. Open a browser window for Earth Engine OAuth authentication
 
@@ -275,73 +214,9 @@ python superres/drop_samples.py <metadata_dir> <data_dir> <location_id> [<locati
 This removes the entries from `dataset_metadata.json` / `dataset_manifest.csv` and
 deletes the corresponding on-disk sample directories.
 
-## Satellite Architecture
-
-The pipeline separates low-resolution (multi-image input stack) and high-resolution (single target) roles. The defaults are:
-
-| Role      | Default       | Alternatives          |
-|-----------|---------------|-----------------------|
-| Low-res   | Landsat 8/9   | Sentinel-2            |
-| High-res  | Sentinel-2    | Landsat, PlanetScope  |
-
-GEE-backed satellites (`Sentinel2Manager`, `LandsatManager`) share retrieval, turbidity
-estimation, and download logic via the `GEESatelliteManager` base class in
-`gee_satellite.py`. To add a new GEE satellite, subclass `GEESatelliteManager`, set a
-`SPEC` (`GEESatelliteSpec`), and register it in `satellites.py`.
-
-## Configuration Files
-
-### `constants.py`
-
-Contains all global constants:
-- Satellite specifications (resolution, bands, collections)
-- Dataset parameters (cloud cover threshold, images per location)
-- Reflectance scale/offset per satellite
-- Seasonal date ranges
-- Output directory structure
-
-### `config.py`
-
-The `Config` class manages:
-- Output directory setup
-- Credential file loading
-- Configuration persistence
-
-**Example:**
-```python
-from superres.config import Config
-
-config = Config(
-    output_dir="./superres",
-    total_samples=1000,
-    ecoregion_file="ecoregions.gpkg",
-)
-
-# Load credentials
-gee_creds = config.load_gee_credentials()
-planet_key = config.load_planet_api_key()
-```
-
-## Data Specifications
-
-- **Sentinel-2**: 13 spectral bands at 10m–60m resolution
-- **Landsat 8/9**: 11 bands (Collection 2 Level-2 SR) at 30m resolution
-- **PlanetScope**: 8 spectral bands at 3m resolution
-- **Focus**: Global shallow-water patches stratified by environment, depth, and turbidity
-- **Cloud Cover**: Max 20%
-- **Sampling**: Proportional to ecoregion area, diverse seasons
-
-## Seasons
-
-The dataset is sampled across 4 seasons:
-1. Winter: January–February
-2. Spring: April–May
-3. Summer: July–August
-4. Autumn: October–November
-
 ## Output Structure
 
-```
+```text
 superres/                              # default output root (-o ./superres)
 ├── data/                              # Downloaded satellite images
 │   ├── sample_000000/
@@ -374,29 +249,189 @@ A sample is only considered complete once `sample_metadata.json` exists; until t
 re-running `download` will pick up where it left off (see
 [Resuming & Growing the Dataset](#resuming--growing-the-dataset)).
 
+## Data Specifications
+
+- **Sentinel-2**: 13 spectral bands at 10m–60m resolution
+- **Landsat 8/9**: 11 bands (Collection 2 Level-2 SR) at 30m resolution
+- **PlanetScope**: 8 spectral bands at 3m resolution
+- **Focus**: Global shallow-water patches stratified by environment, depth, and turbidity
+- **Cloud Cover**: Max 20%
+- **Sampling**: Proportional to ecoregion area, diverse seasons
+
+## Seasons
+
+The dataset is sampled across 4 seasons:
+
+1. Winter: January–February
+2. Spring: April–May
+3. Summer: July–August
+4. Autumn: October–November
+
+## Project Structure
+
+```text
+.
+├── setup_credentials.py           # Script to setup API credentials securely
+├── superres.py                    # CLI entry point: create / download / postprocess / tile / check subcommands
+├── seagrass.py                    # CLI entry point for seagrass dataset preparation
+├── seagrass/                      # Seagrass observation dataset preparation
+│   ├── indonesia.py               # Indonesian sites: augments survey CSVs with Landsat/S2/PlanetScope bands
+│   └── tampa_bay.py               # Tampa Bay transects: augments shapefile data with Landsat/S2/PlanetScope bands
+├── pyproject.toml                 # Project metadata and dependencies
+├── common/                        # Shared helper utilities
+│   ├── dataset_utils.py           # Shared utility functions (directories, logging, CRS helpers)
+│   ├── common.py                  # Label normalisation and dataframe helpers
+│   ├── credentials.py             # Credential loading helpers
+│   ├── gee_satellite.py           # GEESatelliteManager base class (GEE retrieval, turbidity, download)
+│   ├── sentinel.py                # Sentinel-2 band constants and CSV feature helpers
+│   ├── sentinel2.py               # Sentinel2Manager (subclasses GEESatelliteManager)
+│   ├── landsat.py                 # Landsat band constants, CSV feature helpers, and LandsatManager
+└── superres/                      # Main package
+    ├── create_sr_dataset.py       # Main script to create dataset manifest
+    ├── download_and_preprocess.py # Script to download and preprocess data
+    ├── postprocess.py             # Align LR stack to HR grid and rescale to reflectance
+    ├── tile_dataset.py            # Script to tile downloaded rasters for training
+    ├── check_dataset.py           # Dataset integrity checker
+    ├── analyse_dataset.py         # Dataset analysis and figure generation
+    ├── drop_samples.py            # Remove samples from metadata and disk
+    ├── world_sampling.py          # Global water-patch sampling logic
+    ├── config.py                  # Configuration management
+    ├── constants.py               # Global constants and configuration values
+    ├── metadata.py                # Metadata storage and retrieval
+    ├── satellites.py              # Registry of LR/HR satellite managers
+    ├── planetscope.py             # PlanetScope data retrieval (Planet Labs API)
+    ├── data/                      # Downloaded satellite data (created by download script)
+    ├── metadata/                  # Metadata files - JSON/CSV/logs (created by create script)
+    └── credentials/               # API credentials (created by setup_credentials.py)
+```
+
+By default `-o`/`--output` is `./superres`, so the generated `data/`, `metadata/`, and
+`credentials/` directories sit alongside the package source under `superres/`. Pass a
+different `-o` to keep generated data separate from the code.
+
+## Modules
+
+### Core Scripts
+
+- **`superres.py`** - CLI entry point exposing `create`, `download`, `postprocess`, `tile`, and `check` subcommands
+- **`superres/create_sr_dataset.py`** - Creates the dataset by sampling locations proportionally from ecoregions and querying satellite imagery
+- **`superres/download_and_preprocess.py`** - Downloads satellite data and aligns the high-res raster to a standard grid
+- **`superres/postprocess.py`** - Reprojects the low-res image stack onto the high-res grid and rescales all rasters to surface reflectance
+- **`superres/tile_dataset.py`** - Tiles downloaded rasters into fixed-size training patches
+- **`superres/check_dataset.py`** - Validates every sample for structural integrity, raster dimensions, georeferencing, and non-zero values
+- **`superres/analyse_dataset.py`** - Generates a comprehensive set of analysis figures (spatial maps, spectral violins, temporal coverage, PSD curves, alignment diagnostics, etc.)
+- **`superres/drop_samples.py`** - Removes specific samples from metadata and disk so they can be regenerated
+- **`setup_credentials.py`** - Sets up API credentials securely in JSON format
+
+### Configuration
+
+- **`superres/config.py`** - `Config` class for managing dataset configuration and loading credentials
+- **`superres/constants.py`** - Global constants (resolutions, bands, seasons, etc.)
+
+### Data Management
+
+- **`superres/metadata.py`** - `DatasetMetadata` class for managing metadata storage (JSON and CSV)
+- **`superres/world_sampling.py`** - `WorldPatchSampler` for proposing globally-distributed water patch candidates
+
+### Satellite Data Modules
+
+- **`superres/satellites.py`** - Registry of satellite managers; defines `LOWRES_SATELLITES` (Sentinel-2, Landsat) and `HIGHRES_SATELLITES` (Sentinel-2, Landsat, PlanetScope)
+- **`superres/planetscope.py`** - `PlanetScopeManager` for PlanetScope imagery via the Planet Labs Orders API
+- **`common/gee_satellite.py`** - `GEESatelliteManager` base class with shared GEE retrieval, turbidity estimation, and download logic; `GEESatelliteSpec` dataclass
+- **`common/sentinel2.py`** - `Sentinel2Manager` (subclasses `GEESatelliteManager`) for Sentinel-2 via Google Earth Engine
+- **`common/sentinel.py`** - Sentinel-2 band column names, scale factor, spectral index calculations, and DataFrame helpers
+- **`common/landsat.py`** - Landsat band column names, C2 L2 scale/offset conversion, spectral index calculations, DataFrame helpers, and `LandsatManager`
+- **`common/dataset_utils.py`** - Shared utilities (UTM CRS calculation, point sampling, season date ranges, directory/logging helpers)
+
+## Seagrass Dataset Preparation
+
+The `seagrass/` package attaches imagery band values and spectral indices to in-situ
+seagrass observation records, producing analysis-ready CSVs. Run via `seagrass.py`:
+
+```bash
+uv run python seagrass.py --site indonesia <root_dir> [--output-suffix _with_bands] [--gee-project <id>]
+uv run python seagrass.py --site tampabay  <root_dir> [--output <file.csv>]     [--gee-project <id>] \
+  [--survey-date-column <col>] [--planetscope-raster-dir <dir>]
+```
+
+### Imagery sources
+
+| Source | Resolution | Acquisition |
+| --- | --- | --- |
+| Landsat 8/9 (low-res) | 30 m | Sampled from Google Earth Engine |
+| Sentinel-2 (high-res) | 10 m | Sampled from Google Earth Engine |
+| PlanetScope (extra, optional) | 3 m | Read from pre-downloaded local rasters — not auto-downloaded due to quota limits |
+
+### Indonesia (`seagrass/indonesia.py`)
+
+Reads `summary.csv` and `summary_pantai_bama.csv` from `<root_dir>`. Discovers
+PlanetScope scene folders under the same directory (the `*_psscene_analytic_8b_sr_udm2/`
+layout from Planet Orders). Outputs:
+
+- `summary_combined_landsat_with_bands.csv`
+- `summary_combined_sentinel2_with_bands.csv`
+- `summary_combined_planetscope_with_bands.csv` (if PlanetScope folders are present)
+
+### Tampa Bay (`seagrass/tampa_bay.py`)
+
+Reads `seagrass_transect_points.shp` and `seagrass_transect_lines.shp` from `<root_dir>`.
+Outputs a single CSV (default `tampa_bay_transects_prepared.csv`) with Landsat and
+Sentinel-2 columns appended. Pass `--planetscope-raster-dir` to also sample from
+pre-downloaded PlanetScope TIF files in that directory.
+
+## Satellite Architecture
+
+The pipeline separates low-resolution (multi-image input stack) and high-resolution (single target) roles. The defaults are:
+
+| Role      | Default       | Alternatives          |
+|-----------|---------------|-----------------------|
+| Low-res   | Landsat 8/9   | Sentinel-2            |
+| High-res  | Sentinel-2    | Landsat, PlanetScope  |
+
+GEE-backed satellites (`Sentinel2Manager`, `LandsatManager`) share retrieval, turbidity
+estimation, and download logic via the `GEESatelliteManager` base class in
+`common/gee_satellite.py`. To add a new GEE satellite, subclass `GEESatelliteManager`,
+set a `SPEC` (`GEESatelliteSpec`), and register it in `superres/satellites.py`.
+
+## Configuration Files
+
+### `constants.py`
+
+Contains all global constants:
+
+- Satellite specifications (resolution, bands, collections)
+- Dataset parameters (cloud cover threshold, images per location)
+- Reflectance scale/offset per satellite
+- Seasonal date ranges
+- Output directory structure
+
+### `config.py`
+
+The `Config` class manages:
+
+- Output directory setup
+- Credential file loading
+- Configuration persistence
+
+**Example:**
+
+```python
+from superres.config import Config
+
+config = Config(
+    output_dir="./superres",
+    total_samples=1000,
+    ecoregion_file="ecoregions.gpkg",
+)
+
+# Load credentials
+gee_creds = config.load_gee_credentials()
+planet_key = config.load_planet_api_key()
+```
+
 ## Logging
 
 Both scripts produce detailed logs:
 
 - **Creation log**: `./superres/metadata/creation.log`
 - **Download log**: `./superres/metadata/download.log`
-
-## Dependencies
-
-Required packages:
-- `geopandas` - GIS vector data
-- `pandas` - Data manipulation
-- `numpy` - Numerical computing
-- `rasterio` - Raster data I/O
-- `shapely` - Geometric operations
-- `ee` - Google Earth Engine Python API
-- `planet` - Planet Labs SDK (optional, for PlanetScope download)
-- `tqdm` - Progress bars
-
-## Notes
-
-- Credentials are stored securely with restricted file permissions (0o600)
-- All API keys and credentials should be stored in the credentials directory
-- The CSV manifest file enables reproducible downloads without re-querying APIs
-- Ecoregion sampling ensures balanced geographical coverage
-- Seasonal sampling provides temporal diversity

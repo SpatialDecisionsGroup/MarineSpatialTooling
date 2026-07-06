@@ -29,7 +29,7 @@ from .constants import (
     TURBIDITY_BUFFER_METERS,
     TURBIDITY_CLASSES,
 )
-from .gee_satellite import GEESatelliteManager
+from common.gee_satellite import GEESatelliteManager
 from .metadata import DatasetMetadata
 from .satellites import build_highres_manager, build_lowres_manager
 from .world_sampling import SampleTarget, WorldPatchSampler

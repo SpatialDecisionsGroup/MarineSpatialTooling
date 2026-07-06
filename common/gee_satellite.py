@@ -33,7 +33,13 @@ def _gee_call(fn, timeout: int = _GEE_TIMEOUT):
     with ThreadPoolExecutor(max_workers=1) as executor:
         return executor.submit(fn).result(timeout=timeout)
 
-from .constants import MAX_CLOUD_COVER, TURBIDITY_BINS, TURBIDITY_BUFFER_METERS
+MAX_CLOUD_COVER = 20  # percent; shared default across all GEE satellite queries
+TURBIDITY_BINS = [
+    ("clear", -1.0, 0.03),
+    ("moderate", 0.03, 0.08),
+    ("turbid", 0.08, None),
+]
+TURBIDITY_BUFFER_METERS = 1500.0
 
 
 @dataclass(frozen=True)
