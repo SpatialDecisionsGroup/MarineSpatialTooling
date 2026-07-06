@@ -2,6 +2,33 @@
 
 A modular Python framework for creating and downloading multi-image super-resolution datasets from satellite imagery.
 
+## Table of Contents
+
+- [Project Structure](#project-structure)
+- [Modules](#modules)
+  - [Core Scripts](#core-scripts)
+  - [Configuration](#configuration)
+  - [Data Management](#data-management)
+  - [Satellite Data Modules](#satellite-data-modules)
+- [Workflow](#workflow)
+  - [1. Setup Credentials](#1-setup-credentials)
+  - [2. Create Dataset Manifest](#2-create-dataset-manifest)
+  - [3. Download and Preprocess Data](#3-download-and-preprocess-data)
+  - [4. Postprocess](#4-postprocess)
+  - [5. Tile the Dataset](#5-tile-the-dataset-optional)
+  - [6. Check Dataset Integrity](#6-check-dataset-integrity-optional)
+- [Resuming & Growing the Dataset](#resuming--growing-the-dataset)
+  - [Growing the manifest](#growing-the-manifest-create)
+  - [Incremental downloads](#incremental-downloads-download)
+  - [Dropping bad samples](#dropping-bad-samples-drop_samplespy)
+- [Satellite Architecture](#satellite-architecture)
+- [Configuration Files](#configuration-files)
+- [Data Specifications](#data-specifications)
+- [Seasons](#seasons)
+- [Output Structure](#output-structure)
+- [Logging](#logging)
+- [Dependencies](#dependencies)
+
 ## Project Structure
 
 ```
