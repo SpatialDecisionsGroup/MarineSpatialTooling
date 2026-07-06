@@ -9,6 +9,7 @@ describing their collection, bands, and cloud-cover property.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError
 from dataclasses import dataclass, field
 from datetime import datetime
 import logging
@@ -20,6 +21,17 @@ import requests
 import rasterio
 from rasterio.errors import RasterioIOError
 from pyproj import Transformer
+
+# Hard ceiling on any single blocking GEE SDK call (getInfo, getDownloadUrl, etc.).
+# The GEE Python SDK uses its own HTTP transport with no configurable timeout, so
+# we run these calls in a thread and enforce the limit ourselves.
+_GEE_TIMEOUT = 120  # seconds
+
+
+def _gee_call(fn, timeout: int = _GEE_TIMEOUT):
+    """Run fn() in a background thread; raise FuturesTimeoutError if it exceeds timeout."""
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        return executor.submit(fn).result(timeout=timeout)
 
 from .constants import MAX_CLOUD_COVER, TURBIDITY_BINS, TURBIDITY_BUFFER_METERS
 
@@ -149,7 +161,7 @@ class GEESatelliteManager:
 
             collection = collection.sort(self.SPEC.cloud_cover_property).limit(max_images)
 
-            images_info = collection.toList(max_images).getInfo()
+            images_info = _gee_call(collection.toList(max_images).getInfo)
 
             if not images_info:
                 self.logger.debug(
@@ -240,7 +252,7 @@ class GEESatelliteManager:
                 .select([self.SPEC.red_band, self.SPEC.green_band])
             )
 
-            if collection.size().getInfo() == 0:
+            if _gee_call(collection.size().getInfo) == 0:
                 return None
 
             composite = collection.median()
@@ -251,13 +263,14 @@ class GEESatelliteManager:
                     "green": composite.select(self.SPEC.green_band),
                 },
                 ).rename("turbidity")
-            value = turbidity.reduceRegion(
+            reducer_result = turbidity.reduceRegion(
                 reducer=ee.Reducer.mean(),
                 geometry=region,
                 scale=self.SPEC.resolution_meters,
                 bestEffort=True,
                 maxPixels=1e8,
-                ).get("turbidity").getInfo()
+            ).get("turbidity")
+            value = _gee_call(reducer_result.getInfo)
             if value is None:
                 return None
             return float(value)
@@ -384,12 +397,13 @@ class GEESatelliteManager:
             # meter-based scale; passing 'crs': 'EPSG:4326' with a meter scale causes
             # the scale to be interpreted in degrees and results in 1x1 images. Let
             # Earth Engine choose an appropriate CRS for the requested meter scale.
-            url = image.getDownloadUrl({
+            params = {
                 'scale': self.SPEC.resolution_meters,
                 'region': region,
                 'format': 'GeoTIFF',
                 'filePerBand': False,
-            })
+            }
+            url = _gee_call(lambda: image.getDownloadUrl(params))
 
             self.logger.debug(f"Downloading {self.SPEC.display_name} image from {url[:50]}...")
 
