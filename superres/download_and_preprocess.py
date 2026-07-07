@@ -23,8 +23,10 @@ from tqdm import tqdm
 from .config import config_download
 from .constants import (
     DEFAULT_PATCH_SIZE_METERS,
+    LOWRES_MIN_IMAGES,
     PATCH_SIZE_PIXELS,
 )
+from common.landsat import LANDSAT_OFFSET, LANDSAT_SCALE
 from common.gee_satellite import GEESatelliteManager
 from .satellites import (
     DEFAULT_HIGHRES_SATELLITE,
@@ -39,6 +41,52 @@ from common.dataset_utils import ensure_directory, setup_logger
 # for a GEE-backed high-res image, before it gets warped onto the exact
 # manifest grid. Guards against clipping near the patch edges/corners.
 HIGHRES_DOWNLOAD_MARGIN = 1.5
+
+# Scene quality thresholds applied to raw DN downloads (scale/offset applied inline)
+_S2_SCALE         = 1e-4   # Sentinel-2 L2A: reflectance = DN * 0.0001
+_GLINT_NIR_THRESH = 0.08   # mean NIR > 8 % → probable sun glint over water
+_HAZE_BLUE_THRESH = 0.15   # mean blue > 15 % → probable atmospheric haze
+_LS_NIR_BAND      = 5      # Landsat SR_B5 (865 nm)
+_LS_BLUE_BAND     = 2      # Landsat SR_B2 (482 nm)
+_S2_NIR_BAND      = 8      # Sentinel-2 B8 (842 nm)
+_S2_BLUE_BAND     = 2      # Sentinel-2 B2 (490 nm)
+
+
+def _check_image_quality(
+    path: Path,
+    nir_band: int,
+    blue_band: int,
+    scale: float,
+    offset: float = 0.0,
+) -> str:
+    """Return 'glint', 'haze', or '' after applying scale/offset to get reflectance.
+
+    Skips pixels where reflectance <= 0 (fill / nodata after scale/offset).
+    Returns '' (clean) when bands are missing or on read error.
+    """
+    try:
+        with rasterio.open(path) as src:
+            def _mean(bidx: int):
+                if src.count < bidx:
+                    return None
+                raw = src.read(bidx).astype(np.float32)
+                nodata = src.nodata
+                refl = raw * scale + offset
+                mask = refl > 0
+                if nodata is not None:
+                    mask &= raw != nodata
+                valid = refl[mask]
+                return float(valid.mean()) if valid.size > 0 else None
+
+            nir = _mean(nir_band)
+            if nir is not None and nir > _GLINT_NIR_THRESH:
+                return "glint"
+            blue = _mean(blue_band)
+            if blue is not None and blue > _HAZE_BLUE_THRESH:
+                return "haze"
+    except Exception:
+        pass
+    return ""
 
 
 def _lowres_files_present(sample_dir: Path, expected_count: int, lowres_key: str) -> bool:
@@ -170,8 +218,28 @@ def download_lowres_images(sample_metadata, sample_dir, logger, lowres_manager, 
                 output_file.unlink(missing_ok=True)
                 return False
 
+            # Skip individual acquisitions with sun glint or haze rather than
+            # failing the whole sample — keep building the stack from clean dates.
+            issue = _check_image_quality(
+                output_file, _LS_NIR_BAND, _LS_BLUE_BAND, LANDSAT_SCALE, LANDSAT_OFFSET
+            )
+            if issue:
+                logger.warning(
+                    f"{lowres_key} image {index} ({output_file.name}): {issue} detected "
+                    f"(NIR/blue mean too high for a water scene) — skipping this acquisition"
+                )
+                output_file.unlink(missing_ok=True)
+                continue
+
             logger.info(f"Downloaded {lowres_key} image {index}: {output_file.name}")
 
+        kept = len(sorted(lowres_dir.glob(f"{lowres_key}_*.tif")))
+        if kept < LOWRES_MIN_IMAGES:
+            logger.warning(
+                f"Only {kept} clean {lowres_key} image(s) after quality filtering "
+                f"(need {LOWRES_MIN_IMAGES}); rejecting sample"
+            )
+            return False
         return True
 
     except Exception as exc:
@@ -282,6 +350,16 @@ def download_highres_gee_image(sample_metadata, sample_dir, logger, highres_mana
 
         standardized_file = _highres_standardized_file(sample_dir, sample_metadata["location_id"], highres_key)
         if not standardize_highres_patch(raw_file, standardized_file, sample_metadata, logger):
+            return False
+
+        issue = _check_image_quality(standardized_file, _S2_NIR_BAND, _S2_BLUE_BAND, _S2_SCALE)
+        if issue:
+            logger.warning(
+                f"High-res image {asset_id}: {issue} detected (NIR/blue mean too high for "
+                f"a water scene) — rejecting sample. To skip permanently, run: "
+                f"drop_samples ... {int(sample_metadata['location_id'])}"
+            )
+            standardized_file.unlink(missing_ok=True)
             return False
 
         sample_metadata["highres_standardized_file"] = str(standardized_file)

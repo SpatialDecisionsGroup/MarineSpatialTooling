@@ -36,7 +36,10 @@ Values
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
+import os
+import sys
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -56,10 +59,38 @@ from .download_and_preprocess import _highres_standardized_file
 from .satellites import HIGHRES_SATELLITES, LOWRES_SATELLITES
 from common.dataset_utils import setup_logger
 
-# GEE-downloaded GeoTIFFs have a non-standard photometric header tag that
-# generates a harmless "Sum of Photometric type-related color channels"
-# warning from libTIFF via GDAL's C-level stderr. It doesn't affect
-# readability. Redirect stderr to suppress it: run with "2>/dev/null".
+@contextlib.contextmanager
+def _silence_tiff_stderr():
+    """Suppress libTIFF photometric warnings during rasterio opens.
+
+    GEE-exported GeoTIFFs carry a non-standard photometric tag that makes
+    libTIFF write "TIFFReadDirectory: Sum of Photometric type-related color
+    channels…" directly to C-level fd 2 for every file opened.  The message
+    bypasses Python's warnings module and GDAL's error handler, so the only
+    reliable fix is to redirect fd 2 to /dev/null.
+
+    sys.stderr is rebound to a wrapper around the saved original fd so that
+    tqdm, print, and logging output still reach the terminal.
+    """
+    try:
+        real_fd = sys.stderr.fileno()
+    except Exception:
+        yield
+        return
+    saved_fd = os.dup(real_fd)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, real_fd)
+    os.close(devnull)
+    saved_sys_stderr = sys.stderr
+    sys.stderr = os.fdopen(saved_fd, "w", buffering=1)
+    try:
+        yield
+    finally:
+        sys.stderr.flush()
+        new_wrapper = sys.stderr
+        sys.stderr = saved_sys_stderr
+        os.dup2(saved_fd, real_fd)
+        new_wrapper.close()
 
 
 # ─── helpers ────────────────────────────────────────────────────────────────
@@ -152,6 +183,8 @@ class CheckReport:
             "all_nodata":              "VALUES",
             "landsat_clipped":         "DATA QUALITY",
             "large_shift":             "DATA QUALITY",
+            "glint":                   "DATA QUALITY",
+            "haze":                    "DATA QUALITY",
         }
         LABEL = {
             "missing_sample_dir":      "manifest location_id has no sample directory",
@@ -169,6 +202,8 @@ class CheckReport:
             "all_nodata":              "raster appears to contain only zero / nodata values",
             "landsat_clipped":         f"Landsat band >{CLIP_FRAC_THRESHOLD:.0%} pixels saturated (reflectance ≥ 1.0)",
             "large_shift":             f"LR–HR phase-correlation shift > {ALIGNMENT_SHIFT_THRESHOLD} HR pixels ({ALIGNMENT_SHIFT_THRESHOLD * 10} m)",
+            "glint":                   f"probable sun glint (mean NIR reflectance > {GLINT_NIR_THRESHOLD:.0%})",
+            "haze":                    f"probable atmospheric haze (mean blue reflectance > {HAZE_BLUE_THRESHOLD:.0%})",
         }
 
         current_section = None
@@ -341,8 +376,15 @@ def check_sample(sample_dir: Path, report: CheckReport, check_values: bool = Tru
 
 # ─── data quality thresholds ─────────────────────────────────────────────────
 
-CLIP_FRAC_THRESHOLD      = 0.05   # flag if > 5% of reflectance pixels are ≥ 1.0
+CLIP_FRAC_THRESHOLD       = 0.05   # flag if > 5% of reflectance pixels are ≥ 1.0
 ALIGNMENT_SHIFT_THRESHOLD = 3     # flag if phase-correlation shift > 3 HR pixels (30 m)
+GLINT_NIR_THRESHOLD       = 0.08  # flag if mean NIR reflectance > 8 % (probable sun glint)
+HAZE_BLUE_THRESHOLD       = 0.15  # flag if mean blue reflectance > 15 % (probable haze)
+# Band indices in processed reflectance GeoTIFFs (1-indexed, rasterio convention)
+_LS_NIR_BAND  = 5   # Landsat SR_B5  (865 nm)
+_LS_BLUE_BAND = 2   # Landsat SR_B2  (482 nm)
+_S2_NIR_BAND  = 8   # Sentinel-2 B8  (842 nm)
+_S2_BLUE_BAND = 2   # Sentinel-2 B2  (490 nm)
 
 
 def check_landsat_clipping(processed_sample_dir: Path, report: CheckReport, sample_name: str):
@@ -431,6 +473,61 @@ def check_alignment_shift(
         )
 
 
+def check_scene_quality(processed_sample_dir: Path, report: CheckReport, sample_name: str):
+    """Flag samples with sun glint (high NIR) or atmospheric haze (high blue).
+
+    Operates on postprocessed reflectance files (scale/offset already applied).
+    Reports at most one glint and one haze issue per sensor to avoid noise.
+    """
+    def _band_mean(path: Path, band_idx: int) -> Optional[float]:
+        try:
+            with rasterio.open(path) as src:
+                if src.count < band_idx:
+                    return None
+                data = src.read(band_idx).astype(np.float32)
+                nodata = src.nodata
+                valid = data[np.isfinite(data)]
+                if nodata is not None:
+                    valid = valid[valid != nodata]
+                return float(valid.mean()) if valid.size > 0 else None
+        except Exception:
+            return None
+
+    # LR (Landsat): one glint and one haze flag per sample maximum
+    lr_dir = processed_sample_dir / "landsat"
+    if lr_dir.exists():
+        lr_glint = lr_haze = False
+        for tif in sorted(lr_dir.glob("*.tif")):
+            if not lr_glint:
+                nir = _band_mean(tif, _LS_NIR_BAND)
+                if nir is not None and nir > GLINT_NIR_THRESHOLD:
+                    report.add("glint", sample_name,
+                               f"LR {tif.name}: NIR mean {nir:.3f} > {GLINT_NIR_THRESHOLD}")
+                    lr_glint = True
+            if not lr_haze:
+                blue = _band_mean(tif, _LS_BLUE_BAND)
+                if blue is not None and blue > HAZE_BLUE_THRESHOLD:
+                    report.add("haze", sample_name,
+                               f"LR {tif.name}: blue mean {blue:.3f} > {HAZE_BLUE_THRESHOLD}")
+                    lr_haze = True
+            if lr_glint and lr_haze:
+                break
+
+    # HR (Sentinel-2): check the first standardised file only
+    hr_dir = processed_sample_dir / "sentinel2"
+    if hr_dir.exists():
+        for tif in sorted(hr_dir.glob("*.tif")):
+            nir = _band_mean(tif, _S2_NIR_BAND)
+            if nir is not None and nir > GLINT_NIR_THRESHOLD:
+                report.add("glint", sample_name,
+                           f"HR {tif.name}: NIR mean {nir:.3f} > {GLINT_NIR_THRESHOLD}")
+            blue = _band_mean(tif, _S2_BLUE_BAND)
+            if blue is not None and blue > HAZE_BLUE_THRESHOLD:
+                report.add("haze", sample_name,
+                           f"HR {tif.name}: blue mean {blue:.3f} > {HAZE_BLUE_THRESHOLD}")
+            break
+
+
 # ─── driver ─────────────────────────────────────────────────────────────────
 
 def check_dataset():
@@ -471,6 +568,12 @@ def check_dataset():
              f"{ALIGNMENT_SHIFT_THRESHOLD} HR pixels ({ALIGNMENT_SHIFT_THRESHOLD * 10} m). "
              f"Requires --processed-dir. Adds ~0.5 s per sample.",
     )
+    parser.add_argument(
+        "--check-quality", action="store_true",
+        help=f"Flag probable sun glint (mean NIR > {GLINT_NIR_THRESHOLD}) or "
+             f"atmospheric haze (mean blue > {HAZE_BLUE_THRESHOLD}). "
+             f"Requires --processed-dir.",
+    )
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -482,8 +585,8 @@ def check_dataset():
         Path(args.processed_dir) if args.processed_dir
         else data_dir.parent / "processed"
     )
-    run_quality = (args.check_clipping or args.check_alignment) and processed_dir.exists()
-    if (args.check_clipping or args.check_alignment) and not processed_dir.exists():
+    run_quality = (args.check_clipping or args.check_alignment or args.check_quality) and processed_dir.exists()
+    if (args.check_clipping or args.check_alignment or args.check_quality) and not processed_dir.exists():
         print(f"Warning: processed dir not found ({processed_dir}), skipping quality checks.")
 
     manifest_path = Path(args.manifest) if args.manifest else None
@@ -508,15 +611,18 @@ def check_dataset():
     sample_dirs = sorted(d for d in data_dir.iterdir() if d.is_dir() and d.name.startswith("sample_"))
     report.samples_checked = len(sample_dirs)
 
-    for sample_dir in tqdm(sample_dirs, desc="Checking samples"):
-        check_sample(sample_dir, report, check_values=not args.no_values)
-        if run_quality:
-            proc_sample = processed_dir / sample_dir.name
-            if proc_sample.exists():
-                if args.check_clipping:
-                    check_landsat_clipping(proc_sample, report, sample_dir.name)
-                if args.check_alignment:
-                    check_alignment_shift(proc_sample, report, sample_dir.name)
+    with _silence_tiff_stderr():
+        for sample_dir in tqdm(sample_dirs, desc="Checking samples"):
+            check_sample(sample_dir, report, check_values=not args.no_values)
+            if run_quality:
+                proc_sample = processed_dir / sample_dir.name
+                if proc_sample.exists():
+                    if args.check_clipping:
+                        check_landsat_clipping(proc_sample, report, sample_dir.name)
+                    if args.check_alignment:
+                        check_alignment_shift(proc_sample, report, sample_dir.name)
+                    if args.check_quality:
+                        check_scene_quality(proc_sample, report, sample_dir.name)
 
     # ── Output ────────────────────────────────────────────────────────────────
     report.print_summary(verbose=args.verbose)

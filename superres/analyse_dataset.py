@@ -1111,9 +1111,29 @@ def fig_alignment_quality(processed_dir: Path, df: pd.DataFrame, n_samples: int,
 _LR_RGB = (4, 3, 2)   # Landsat: SR_B4 / SR_B3 / SR_B2
 _HR_RGB = (4, 3, 2)   # Sentinel-2: B4 / B3 / B2
 
+# Physical scale/offset to convert stored DN → surface reflectance
+_LR_SCALE, _LR_OFFSET = 0.0000275, -0.2   # Landsat C2 L2
+_HR_SCALE, _HR_OFFSET = 1e-4, 0.0         # Sentinel-2 L2A
+_DISPLAY_MAX = 0.2   # clip reflectance at 20% before normalising
+_DISPLAY_GAMMA = 2.0  # sqrt stretch — boosts dark water without distorting colour ratios
 
-def _load_rgb(sat_dir: Path, r: int, g: int, b: int) -> "np.ndarray | None":
-    """Read three bands, apply 2–98th-percentile stretch, return (H,W,3) uint8 or None."""
+
+def _load_rgb(
+    sat_dir: Path,
+    r: int,
+    g: int,
+    b: int,
+    scale: float = 1.0,
+    offset: float = 0.0,
+    display_max: float = 1.0,
+    gamma: float = 1.0,
+) -> "np.ndarray | None":
+    """Read three bands, convert to reflectance, return (H,W,3) uint8 or None.
+
+    Applies a fixed physical scale/offset (preserving true colour across sensors and scenes),
+    clips at display_max, then applies a gamma stretch to lift dark water pixels into a
+    visible range without distorting the relative brightness of RGB channels.
+    """
     import rasterio as _rio
     files = sorted(sat_dir.glob("*.tif"))
     if not files:
@@ -1125,23 +1145,22 @@ def _load_rgb(sat_dir: Path, r: int, g: int, b: int) -> "np.ndarray | None":
             bands = np.stack([src.read(i).astype(np.float32) for i in (r, g, b)], axis=-1)
     except Exception:
         return None
-    finite = np.isfinite(bands)
-    for c in range(3):
-        ch = bands[:, :, c]
-        valid = ch[finite[:, :, c]]
-        if valid.size >= 2:
-            lo, hi = np.percentile(valid, 2), np.percentile(valid, 98)
-            if hi > lo:
-                bands[:, :, c] = (ch - lo) / (hi - lo)
-    bands[~finite] = 0
-    return (np.clip(bands, 0, 1) * 255).astype(np.uint8)
+    bands = bands * scale + offset
+    bands = np.clip(bands, 0, display_max) / display_max
+    if gamma != 1.0:
+        bands = np.power(bands, 1.0 / gamma)
+    return (bands * 255).astype(np.uint8)
 
 
 def _render_sample_row(axes, processed_dir: Path, loc_id: int, tag: str, meta: dict):
     """Fill a 2-element axes row with LR and HR RGB for one sample."""
     sample = f"sample_{loc_id:06d}"
-    lr_rgb = _load_rgb(processed_dir / sample / "landsat",   *_LR_RGB)
-    hr_rgb = _load_rgb(processed_dir / sample / "sentinel2", *_HR_RGB)
+    lr_rgb = _load_rgb(processed_dir / sample / "landsat",   *_LR_RGB,
+                       scale=_LR_SCALE, offset=_LR_OFFSET,
+                       display_max=_DISPLAY_MAX, gamma=_DISPLAY_GAMMA)
+    hr_rgb = _load_rgb(processed_dir / sample / "sentinel2", *_HR_RGB,
+                       scale=_HR_SCALE, offset=_HR_OFFSET,
+                       display_max=_DISPLAY_MAX, gamma=_DISPLAY_GAMMA)
     env   = meta.get("environment_class", "?")
     depth = meta.get("depth_class", "?")
     turb  = meta.get("turbidity_class", "?")

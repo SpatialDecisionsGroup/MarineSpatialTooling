@@ -190,6 +190,12 @@ def config_create():
              "checkpoint - e.g. no low-res images were actually available for that location/date "
              "window) and regenerate replacements for the same slot/stratum. Implies --resume.",
     )
+    parser.add_argument(
+        "--manifest-only",
+        action="store_true",
+        help="Generate the manifest CSV only; skip downloading images. "
+             "Use when you want to inspect the sampling plan before committing to downloads.",
+    )
 
     args = parser.parse_args()
 
@@ -234,6 +240,7 @@ def config_create():
     config.exclude_ecoregions = exclude_list
     config.resume = args.resume or args.check
     config.check_existing = args.check
+    config.manifest_only = args.manifest_only
     config.lowres_satellite = args.lowres_satellite
     config.highres_satellite = args.highres_satellite
     config.lowres_window_days = args.lowres_window_days

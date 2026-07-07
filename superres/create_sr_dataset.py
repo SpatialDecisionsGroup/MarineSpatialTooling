@@ -4,6 +4,7 @@ Multi-image super-resolution dataset creator for global water patches.
 
 from __future__ import annotations
 
+import json
 import logging
 import random
 import shutil
@@ -30,6 +31,7 @@ from .constants import (
     TURBIDITY_CLASSES,
 )
 from common.gee_satellite import GEESatelliteManager
+from .download_and_preprocess import download_highres_gee_image, download_lowres_images
 from .metadata import DatasetMetadata
 from .satellites import build_highres_manager, build_lowres_manager
 from .world_sampling import SampleTarget, WorldPatchSampler
@@ -344,6 +346,11 @@ def create_dataset():
                 )
                 continue
 
+            # location_id is allocated lazily on the first viable HR candidate so
+            # that failed download attempts (glint/haze/fill) can reuse the same ID
+            # and directory without burning a new slot per rejected image.
+            candidate_location_id: Optional[int] = None
+
             accepted = False
             for highres_image in highres_candidates:
                 highres_date_str = str(highres_image.get("date", ""))[:10]
@@ -410,8 +417,11 @@ def create_dataset():
                     )
                     break
 
+                if candidate_location_id is None:
+                    candidate_location_id = _allocate_location_id()
+
                 sample = {
-                    "location_id": _allocate_location_id(),
+                    "location_id": candidate_location_id,
                     "latitude": candidate["latitude"],
                     "longitude": candidate["longitude"],
                     "season_id": _season_id_from_month(highres_day.month),
@@ -422,6 +432,8 @@ def create_dataset():
                     "turbidity_class": matched_target.turbidity_class,
                     "turbidity_index": turbidity_info["turbidity_index"],
                     "date_range": (lowres_window_start, lowres_window_end),
+                    "date_range_start": lowres_window_start,
+                    "date_range_end": lowres_window_end,
                     "lowres_satellite": config.lowres_satellite,
                     "lowres_images": lowres_images,
                     "highres_satellite": config.highres_satellite,
@@ -433,6 +445,41 @@ def create_dataset():
                     "target_origin_y": candidate["target_origin_y"],
                     **_build_highres_identifier_fields(highres_manager, highres_image, aoi_geojson),
                 }
+
+                if not getattr(config, "manifest_only", False):
+                    sample_dir = config.data_dir / f"sample_{candidate_location_id:06d}"
+                    sample_dir.mkdir(parents=True, exist_ok=True)
+                    download_start = perf_counter()
+                    lowres_ok = download_lowres_images(
+                        sample, sample_dir, logger, lowres_manager,
+                        LOWRES_MAX_IMAGES, config.lowres_satellite,
+                    )
+                    if not lowres_ok:
+                        shutil.rmtree(sample_dir, ignore_errors=True)
+                        logger.debug(
+                            "LR download/quality failed for HR date %s at (%.6f, %.6f), trying next candidate",
+                            highres_date_str, candidate["latitude"], candidate["longitude"],
+                        )
+                        continue
+                    highres_ok = download_highres_gee_image(
+                        sample, sample_dir, logger, highres_manager, config.highres_satellite,
+                    )
+                    if not highres_ok:
+                        shutil.rmtree(sample_dir, ignore_errors=True)
+                        logger.debug(
+                            "HR download/quality failed for %s at (%.6f, %.6f), trying next candidate",
+                            highres_date_str, candidate["latitude"], candidate["longitude"],
+                        )
+                        continue
+                    download_seconds = perf_counter() - download_start
+                    # Update lowres_count to reflect actual files kept after quality filtering
+                    actual_lr = sorted((sample_dir / config.lowres_satellite).glob("*.tif"))
+                    sample["lowres_count"] = len(actual_lr)
+                    with open(sample_dir / "sample_metadata.json", "w") as _f:
+                        json.dump(sample, _f, indent=2, default=str)
+                else:
+                    download_seconds = 0.0
+
                 metadata.add_sample(sample)
                 current_total += 1
                 remaining_counts[matched_target] -= 1
@@ -441,7 +488,8 @@ def create_dataset():
                 metadata.update_dataset_sample_count(current_total)
                 metadata.save_checkpoint()
                 logger.info(
-                    "Accepted candidate at (%.6f, %.6f) into %s/%s/%s; remaining=%s; timings candidate=%.2fs highres=%.2fs lowres=%.2fs turbidity=%.2fs total_run=%.2fs",
+                    "Accepted candidate at (%.6f, %.6f) into %s/%s/%s; remaining=%s; "
+                    "timings candidate=%.2fs highres=%.2fs lowres=%.2fs turbidity=%.2fs download=%.2fs total_run=%.2fs",
                     candidate["latitude"],
                     candidate["longitude"],
                     matched_target.environment_class,
@@ -452,6 +500,7 @@ def create_dataset():
                     highres_seconds,
                     lowres_seconds,
                     turbidity_seconds,
+                    download_seconds,
                     perf_counter() - run_start,
                 )
                 break
