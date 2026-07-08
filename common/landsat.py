@@ -29,6 +29,28 @@ LANDSAT_WINDOW_DAYS = 30
 LANDSAT_INDEX_COLUMNS = ["ls_ndvi", "ls_ndwi", "ls_mndwi", "ls_evi", "ls_savi", "ls_nbr"]
 
 
+def compute_landsat_indices(features: Dict[str, float]) -> Dict[str, float]:
+    """Add spectral indices to a dict that already has scaled ls_b* values (0–1).
+
+    Modifies `features` in place and returns it.  Call this after populating band
+    values from any source (GEE or ACOLITE) to get a consistent index set.
+    """
+    b2 = features.get("ls_b2", np.nan)  # Blue
+    b3 = features.get("ls_b3", np.nan)  # Green
+    b4 = features.get("ls_b4", np.nan)  # Red
+    b5 = features.get("ls_b5", np.nan)  # NIR
+    b6 = features.get("ls_b6", np.nan)  # SWIR1
+    b7 = features.get("ls_b7", np.nan)  # SWIR2
+
+    features["ls_ndvi"] = float((b5 - b4) / (b5 + b4)) if not (pd.isna(b5) or pd.isna(b4) or (b5 + b4) == 0) else np.nan
+    features["ls_ndwi"] = float((b3 - b5) / (b3 + b5)) if not (pd.isna(b3) or pd.isna(b5) or (b3 + b5) == 0) else np.nan
+    features["ls_mndwi"] = float((b3 - b6) / (b3 + b6)) if not (pd.isna(b3) or pd.isna(b6) or (b3 + b6) == 0) else np.nan
+    features["ls_evi"] = float(2.5 * (b5 - b4) / (b5 + 6 * b4 - 7.5 * b2 + 1)) if not (pd.isna(b2) or pd.isna(b4) or pd.isna(b5) or (b5 + 6 * b4 - 7.5 * b2 + 1) == 0) else np.nan
+    features["ls_savi"] = float(1.5 * (b5 - b4) / (b5 + b4 + 0.5)) if not (pd.isna(b5) or pd.isna(b4) or (b5 + b4 + 0.5) == 0) else np.nan
+    features["ls_nbr"] = float((b5 - b7) / (b5 + b7)) if not (pd.isna(b5) or pd.isna(b7) or (b5 + b7) == 0) else np.nan
+    return features
+
+
 def build_landsat_feature_values(stats: Dict[str, float], scene_date: str) -> Dict[str, float]:
     """Convert Earth Engine reduction results into Landsat reflectance features.
 
@@ -43,43 +65,7 @@ def build_landsat_feature_values(stats: Dict[str, float], scene_date: str) -> Di
         else:
             features[col_name] = float(value) * LANDSAT_SCALE + LANDSAT_OFFSET
 
-    b2 = features.get("ls_b2", np.nan)  # Blue
-    b3 = features.get("ls_b3", np.nan)  # Green
-    b4 = features.get("ls_b4", np.nan)  # Red
-    b5 = features.get("ls_b5", np.nan)  # NIR
-    b6 = features.get("ls_b6", np.nan)  # SWIR1
-    b7 = features.get("ls_b7", np.nan)  # SWIR2
-
-    if pd.isna(b5) or pd.isna(b4) or (b5 + b4) == 0:
-        features["ls_ndvi"] = np.nan
-    else:
-        features["ls_ndvi"] = float((b5 - b4) / (b5 + b4))
-
-    if pd.isna(b3) or pd.isna(b5) or (b3 + b5) == 0:
-        features["ls_ndwi"] = np.nan
-    else:
-        features["ls_ndwi"] = float((b3 - b5) / (b3 + b5))
-
-    if pd.isna(b3) or pd.isna(b6) or (b3 + b6) == 0:
-        features["ls_mndwi"] = np.nan
-    else:
-        features["ls_mndwi"] = float((b3 - b6) / (b3 + b6))
-
-    if pd.isna(b2) or pd.isna(b4) or pd.isna(b5) or (b5 + 6 * b4 - 7.5 * b2 + 1) == 0:
-        features["ls_evi"] = np.nan
-    else:
-        features["ls_evi"] = float(2.5 * (b5 - b4) / (b5 + 6 * b4 - 7.5 * b2 + 1))
-
-    if pd.isna(b5) or pd.isna(b4) or (b5 + b4 + 0.5) == 0:
-        features["ls_savi"] = np.nan
-    else:
-        features["ls_savi"] = float(1.5 * (b5 - b4) / (b5 + b4 + 0.5))
-
-    if pd.isna(b5) or pd.isna(b7) or (b5 + b7) == 0:
-        features["ls_nbr"] = np.nan
-    else:
-        features["ls_nbr"] = float((b5 - b7) / (b5 + b7))
-
+    compute_landsat_indices(features)
     features["ls_scene_date"] = scene_date
     return features
 

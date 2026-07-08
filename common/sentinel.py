@@ -49,6 +49,32 @@ SENTINEL2_WINDOW_DAYS = 15
 SENTINEL2_INDEX_COLUMNS = ["ndvi", "gndvi", "ndre", "ndwi", "mndwi", "evi", "savi", "nbr"]
 
 
+def compute_sentinel2_indices(features: Dict[str, float]) -> Dict[str, float]:
+    """Add spectral indices to a dict that already has scaled s2_b* values (0–1).
+
+    Modifies `features` in place and returns it.  Call this after populating band
+    values from any source (GEE or ACOLITE) to get a consistent index set.
+    """
+    b2 = features.get("s2_b2", np.nan)
+    b3 = features.get("s2_b3", np.nan)
+    b4 = features.get("s2_b4", np.nan)
+    b5 = features.get("s2_b5", np.nan)
+    b8 = features.get("s2_b8", np.nan)
+    b8a = features.get("s2_b8a", np.nan)
+    b11 = features.get("s2_b11", np.nan)
+    b12 = features.get("s2_b12", np.nan)
+
+    features["ndvi"] = float((b8 - b4) / (b8 + b4)) if not (pd.isna(b8) or pd.isna(b4) or (b8 + b4) == 0) else np.nan
+    features["gndvi"] = float((b8 - b3) / (b8 + b3)) if not (pd.isna(b8) or pd.isna(b3) or (b8 + b3) == 0) else np.nan
+    features["ndre"] = float((b8a - b5) / (b8a + b5)) if not (pd.isna(b8a) or pd.isna(b5) or (b8a + b5) == 0) else np.nan
+    features["ndwi"] = float((b3 - b8) / (b3 + b8)) if not (pd.isna(b3) or pd.isna(b8) or (b3 + b8) == 0) else np.nan
+    features["mndwi"] = float((b3 - b11) / (b3 + b11)) if not (pd.isna(b3) or pd.isna(b11) or (b3 + b11) == 0) else np.nan
+    features["evi"] = float(2.5 * (b8 - b4) / (b8 + 6 * b4 - 7.5 * b2 + 1)) if not (pd.isna(b2) or pd.isna(b4) or pd.isna(b8) or (b8 + 6 * b4 - 7.5 * b2 + 1) == 0) else np.nan
+    features["savi"] = float(1.5 * (b8 - b4) / (b8 + b4 + 0.5)) if not (pd.isna(b8) or pd.isna(b4) or (b8 + b4 + 0.5) == 0) else np.nan
+    features["nbr"] = float((b8 - b12) / (b8 + b12)) if not (pd.isna(b8) or pd.isna(b12) or (b8 + b12) == 0) else np.nan
+    return features
+
+
 def build_sentinel2_feature_values(stats: Dict[str, float], scene_date: str) -> Dict[str, float]:
     """Convert Earth Engine reduction results into normalized Sentinel-2 features.
 
@@ -65,55 +91,7 @@ def build_sentinel2_feature_values(stats: Dict[str, float], scene_date: str) -> 
         else:
             features[output_name] = float(value) / SENTINEL2_SCALE
 
-    b2 = features.get("s2_b2", np.nan)
-    b3 = features.get("s2_b3", np.nan)
-    b4 = features.get("s2_b4", np.nan)
-    b5 = features.get("s2_b5", np.nan)
-    b8 = features.get("s2_b8", np.nan)
-    b8a = features.get("s2_b8a", np.nan)
-    b11 = features.get("s2_b11", np.nan)
-    b12 = features.get("s2_b12", np.nan)
-
-    if pd.isna(b8) or pd.isna(b4) or (b8 + b4) == 0:
-        features["ndvi"] = np.nan
-    else:
-        features["ndvi"] = float((b8 - b4) / (b8 + b4))
-
-    if pd.isna(b8) or pd.isna(b3) or (b8 + b3) == 0:
-        features["gndvi"] = np.nan
-    else:
-        features["gndvi"] = float((b8 - b3) / (b8 + b3))
-
-    if pd.isna(b8a) or pd.isna(b5) or (b8a + b5) == 0:
-        features["ndre"] = np.nan
-    else:
-        features["ndre"] = float((b8a - b5) / (b8a + b5))
-
-    if pd.isna(b3) or pd.isna(b8) or (b3 + b8) == 0:
-        features["ndwi"] = np.nan
-    else:
-        features["ndwi"] = float((b3 - b8) / (b3 + b8))
-
-    if pd.isna(b3) or pd.isna(b11) or (b3 + b11) == 0:
-        features["mndwi"] = np.nan
-    else:
-        features["mndwi"] = float((b3 - b11) / (b3 + b11))
-
-    if pd.isna(b2) or pd.isna(b4) or pd.isna(b8) or (b8 + 6 * b4 - 7.5 * b2 + 1) == 0:
-        features["evi"] = np.nan
-    else:
-        features["evi"] = float(2.5 * (b8 - b4) / (b8 + 6 * b4 - 7.5 * b2 + 1))
-
-    if pd.isna(b8) or pd.isna(b4) or (b8 + b4 + 0.5) == 0:
-        features["savi"] = np.nan
-    else:
-        features["savi"] = float(1.5 * (b8 - b4) / (b8 + b4 + 0.5))
-
-    if pd.isna(b8) or pd.isna(b12) or (b8 + b12) == 0:
-        features["nbr"] = np.nan
-    else:
-        features["nbr"] = float((b8 - b12) / (b8 + b12))
-
+    compute_sentinel2_indices(features)
     features["scene_date"] = scene_date
     return features
 

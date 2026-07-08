@@ -45,6 +45,13 @@ from common.landsat import (
 )
 from common.sentinel2 import Sentinel2Manager
 from common.landsat import LandsatManager
+from common.depth_correction import (
+    S2_LYZENGA_PAIRS,
+    LS_LYZENGA_PAIRS,
+    S2_LYZENGA_COLUMNS,
+    LS_LYZENGA_COLUMNS,
+    add_lyzenga_columns,
+)
 import argparse
 
 
@@ -503,6 +510,30 @@ def build_combined_frame(frames: list[tuple[str, pd.DataFrame]]) -> pd.DataFrame
     return combined
 
 
+def augment_with_lyzenga(frame: pd.DataFrame) -> pd.DataFrame:
+    """Add Lyzenga depth-invariant bottom index columns to an enriched frame.
+
+    Indices are computed from the s2_b* / ls_b* band columns already present.
+    Rows with missing or non-positive band values yield NaN for those indices.
+    """
+    frame = frame.copy()
+    for col in S2_LYZENGA_COLUMNS + LS_LYZENGA_COLUMNS:
+        frame[col] = np.nan
+
+    for row_index, row in frame.iterrows():
+        s2_vals = {c: row.get(c, np.nan) for c in ["s2_b1", "s2_b2", "s2_b3", "s2_b4"]}
+        s2_lyz = add_lyzenga_columns(s2_vals, S2_LYZENGA_PAIRS)
+        for col in S2_LYZENGA_COLUMNS:
+            frame.at[row_index, col] = s2_lyz.get(col, np.nan)
+
+        ls_vals = {c: row.get(c, np.nan) for c in ["ls_b1", "ls_b2", "ls_b3", "ls_b4"]}
+        ls_lyz = add_lyzenga_columns(ls_vals, LS_LYZENGA_PAIRS)
+        for col in LS_LYZENGA_COLUMNS:
+            frame.at[row_index, col] = ls_lyz.get(col, np.nan)
+
+    return frame
+
+
 def prepare_indonesia(
     root_dir: Path | str = DEFAULT_ROOT,
     output_suffix: str = "_with_bands",
@@ -554,16 +585,19 @@ def prepare_indonesia(
     ls_combined = build_combined_frame(ls_frames)
 
     if not ps_combined.empty:
+        ps_combined = augment_with_lyzenga(ps_combined)
         out = root_dir / f"summary_combined_planetscope{output_suffix}.csv"
         ps_combined.to_csv(out, index=False)
         print(f"Wrote {out}")
 
     if not s2_combined.empty:
+        s2_combined = augment_with_lyzenga(s2_combined)
         out = root_dir / f"summary_combined_sentinel2{output_suffix}.csv"
         s2_combined.to_csv(out, index=False)
         print(f"Wrote {out}")
 
     if not ls_combined.empty:
+        ls_combined = augment_with_lyzenga(ls_combined)
         out = root_dir / f"summary_combined_landsat{output_suffix}.csv"
         ls_combined.to_csv(out, index=False)
         print(f"Wrote {out}")
