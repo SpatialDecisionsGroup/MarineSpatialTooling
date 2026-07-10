@@ -4,19 +4,49 @@ The site spreadsheets live alongside the downloaded PlanetScope folders in:
 /home/ysi/Documents/Uni/MQPostdoc/projects/superres/indonesian_seagrass
 
 Imagery sources:
-  - Landsat 8/9 (30 m, low-res): downloaded from Google Earth Engine.
-  - Sentinel-2 (10 m, high-res): downloaded from Google Earth Engine.
+  - Landsat 8/9 (30 m, low-res): ACOLITE NetCDF output if available, else GEE.
+  - Sentinel-2 (10 m, high-res): ACOLITE NetCDF output if available, else GEE.
   - PlanetScope (3 m, for later comparison): read from pre-downloaded local rasters
     since PlanetScope cannot be batch-downloaded via API due to quota limits.
 
-The script samples each source at the observation points, writes per-source CSVs,
-and then runs a Random Forest classification accuracy comparison across resolutions,
-saving the result to accuracy_comparison.csv.
+The 9 sites fall into two clusters ~200km apart (see BAWEAN_LIMIT / BALURAN_LIMIT),
+so raw-scene download and ACOLITE processing run per cluster:
+
+  # 1. See which dates need coverage + the bounding box, per cluster
+  python seagrass/indonesia.py dates --root <root_dir>
+
+  # 2. Download Level-1 scenes for one cluster (free accounts required — see below)
+  python seagrass/indonesia.py download --root <root_dir> --cluster bawean \\
+      --scenes /raw_scenes/bawean/ \\
+      --cdse-user you@email.com --cdse-pass yourpass \\
+      --usgs-user yourname --usgs-token yourtoken
+  # repeat with --cluster baluran --scenes /raw_scenes/baluran/
+
+  # 3. Run ACOLITE per cluster (limit is set from the cluster automatically)
+  python seagrass/indonesia.py acolite --cluster bawean \\
+      --scenes /raw_scenes/bawean/ --acolite-out /acolite_out/
+  # repeat with --cluster baluran --scenes /raw_scenes/baluran/
+
+  # 4. Build the CSVs (ACOLITE output covers both clusters; falls back to GEE
+  #    per-row for anything ACOLITE didn't cover). --gee-project can be omitted
+  #    if gee_project is set in common/credentials.json.
+  python seagrass/indonesia.py build --root <root_dir> --acolite-dir /acolite_out/
+
+Skipping steps 1-3 and running 'build' with just --root (no --acolite-dir) uses
+GEE's standard L2A/SR products for everything — ACOLITE is an upgrade, not a
+requirement, same as seagrass/tampa_bay.py.
+
+Accounts
+--------
+Sentinel-2 : https://dataspace.copernicus.eu  (free)
+Landsat     : https://ers.cr.usgs.gov          (free, generate Application Token
+              in your profile under "Access" → "Create Application Token")
+ACOLITE     : see common/acolite_pipeline.py's module docstring.
 """
 
 from __future__ import annotations
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import ee
@@ -32,16 +62,16 @@ from common.sentinel import (
     SENTINEL2_DOWNLOAD_BANDS,
     SENTINEL2_BAND_NAME_MAP,
     SENTINEL2_SCALE,
-    SENTINEL2_WINDOW_DAYS,
     SENTINEL2_INDEX_COLUMNS,
     build_sentinel2_feature_values,
+    compute_sentinel2_indices,
 )
 from common.landsat import (
     LANDSAT_BAND_COLUMNS,
     LANDSAT_DOWNLOAD_BANDS,
     LANDSAT_INDEX_COLUMNS,
-    LANDSAT_WINDOW_DAYS,
     build_landsat_feature_values,
+    compute_landsat_indices,
 )
 from common.sentinel2 import Sentinel2Manager
 from common.landsat import LandsatManager
@@ -52,6 +82,18 @@ from common.depth_correction import (
     LS_LYZENGA_COLUMNS,
     add_lyzenga_columns,
 )
+from common.acolite_pipeline import (
+    ACOLITE_REPO_PATH,
+    ACOLITE_S2_BAND_MAP,
+    ACOLITE_LS_BAND_MAP,
+    merge_date_windows,
+    download_sentinel2,
+    download_landsat,
+    run_acolite_batch,
+    scan_acolite_output,
+    select_acolite_scene,
+    sample_acolite_nc,
+)
 import argparse
 
 
@@ -60,6 +102,50 @@ SUMMARY_FILES = ["summary.csv", "summary_pantai_bama.csv"]
 PS_BAND_COLUMNS = ["coastal_blue", "blue", "green_i", "green", "yellow", "red", "rededge", "nir"]
 PS_INDEX_COLUMNS = ["ndvi", "gndvi", "ndre", "ndwi", "evi", "savi", "cig"]
 PS_BAND_SCALE = 10000.0
+
+# Wider than common/sentinel.py's and common/landsat.py's defaults (15 / 30 days):
+# some Indonesian sites (Somor-somor, Pamasaran, Cinta) sit under persistent cloud,
+# so a narrow window can miss every clear scene entirely.
+INDONESIA_S2_WINDOW_DAYS = 60
+INDONESIA_LS_WINDOW_DAYS = 60
+
+# Scene-level CLOUDY_PIXEL_PERCENTAGE / CLOUD_COVER is a whole-tile average, which
+# can look fine while the small reef AOI itself sits under a cloud. Score cloud
+# cover directly over the sample point instead: Sentinel-2 via Cloud Score+'s "cs"
+# band (0=cloud, 1=clear), Landsat via the QA_PIXEL "Clear" bit (bit 6).
+S2_CLOUD_SCORE_COLLECTION = "GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED"
+LOCAL_CLARITY_BUFFER_M = 45
+
+# Local clear-score tiers to try in order (0-1, higher = clearer); the first tier
+# with any candidate wins, and the closest-by-date scene within that tier is used.
+CLEAR_SCORE_TIERS = (0.75, 0.6, 0.4)
+
+# Ground footprint sampled around each observation point for band extraction.
+# This must be a fixed physical size shared across sensors, NOT a fixed pixel
+# count — "3x3 pixels" means 900 m^2 at Sentinel-2's 10 m resolution but 8100 m^2
+# at Landsat's 30 m, a 9x difference in the area actually being averaged. That
+# asymmetry (previously buffer(15) for S2 vs buffer(45) for Landsat) biases any
+# cross-sensor comparison, since a bigger footprint averages out more local
+# noise/GPS error independent of anything about the sensor itself.
+BAND_SAMPLE_BUFFER_M = 45
+
+# The 9 sites fall into two geographically distant clusters (~200 km apart) —
+# ACOLITE limit format: [south, west, north, east], ±0.05° buffer around each
+# cluster's site extent (same convention as seagrass/tampa_bay.py's TAMPA_BAY_LIMIT).
+BAWEAN_LIMIT = [-5.907, 112.538, -5.698, 112.787]     # Cinta, Jerat Lanjeng, Pamasaran, Pasir Putih, Somor-somor
+BALURAN_LIMIT = [-7.895, 114.411, -7.793, 114.513]    # Pantai Bama (4 stations)
+CLUSTER_LIMITS = {"bawean": BAWEAN_LIMIT, "baluran": BALURAN_LIMIT}
+
+_BAWEAN_SITES = {"cinta", "jerat lanjeng", "pamasaran", "pasir putih", "somor somor"}
+
+
+def site_cluster(location: str) -> str | None:
+    normalized = normalise_label(location)
+    if normalized.startswith("pantai bama"):
+        return "baluran"
+    if normalized in _BAWEAN_SITES:
+        return "bawean"
+    return None
 
 
 def normalise_label(value: str) -> str:
@@ -196,31 +282,93 @@ def select_scene_by_date(files: list[Path], row: pd.Series) -> Path:
     return files[0]
 
 
-def select_scene_info_by_date(images_info: list[dict], row: pd.Series) -> tuple[int, dict] | None:
-    """Pick the best GEE scene for a row, preferring a date match."""
-    row_date = parse_date_object(row.get("Date", ""))
-    if row_date is None:
-        return 0, images_info[0]
+def _s2_local_clear_candidates(
+    lon: float, lat: float, date_start: str, date_end: str,
+    buffer_m: float = LOCAL_CLARITY_BUFFER_M,
+) -> list[dict]:
+    """Sentinel-2 candidates in the window, scored by Cloud Score+ AOI-local clarity."""
+    point = ee.Geometry.Point([lon, lat]).buffer(buffer_m).bounds()
+    s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+          .filterBounds(point).filterDate(date_start, date_end))
+    cs_plus = ee.ImageCollection(S2_CLOUD_SCORE_COLLECTION)
+    linked = s2.linkCollection(cs_plus, ["cs"])
 
-    exact_matches: list[tuple[int, dict]] = []
-    nearest_candidate: tuple[int, int, dict] | None = None
+    def _tag(img):
+        local_cs = img.select("cs").reduceRegion(ee.Reducer.mean(), point, 10).get("cs")
+        return img.set("local_clear_score", local_cs).set("full_asset_id", img.get("system:id"))
 
-    for index, image_info in enumerate(images_info):
-        image_date = parse_date_object(image_info.get("date", ""))
-        if image_date is None:
+    info = linked.map(_tag).select([]).getInfo()
+    return _candidates_from_feature_info(info)
+
+
+def _landsat_local_clear_candidates(
+    lon: float, lat: float, date_start: str, date_end: str,
+    buffer_m: float = LOCAL_CLARITY_BUFFER_M,
+) -> list[dict]:
+    """Landsat candidates in the window, scored by fraction of QA_PIXEL "Clear" pixels over the AOI."""
+    point = ee.Geometry.Point([lon, lat]).buffer(buffer_m).bounds()
+    coll = (ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
+            .merge(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2"))
+            .filterBounds(point).filterDate(date_start, date_end))
+
+    def _tag(img):
+        clear_bit = img.select("QA_PIXEL").bitwiseAnd(1 << 6).gt(0).rename("clear")
+        local_clear = clear_bit.reduceRegion(ee.Reducer.mean(), point, 30).get("clear")
+        return img.set("local_clear_score", local_clear).set("full_asset_id", img.get("system:id"))
+
+    info = coll.map(_tag).select([]).getInfo()
+    return _candidates_from_feature_info(info)
+
+
+def _candidates_from_feature_info(info: dict) -> list[dict]:
+    candidates = []
+    for feat in info.get("features", []):
+        props = feat.get("properties", {})
+        timestamp = props.get("system:time_start")
+        asset_id = props.get("full_asset_id")
+        if timestamp is None or asset_id is None:
             continue
-        if image_date.date() == row_date.date():
-            exact_matches.append((index, image_info))
-        else:
-            distance = abs((image_date - row_date).days)
-            if nearest_candidate is None or distance < nearest_candidate[0]:
-                nearest_candidate = (distance, index, image_info)
+        candidates.append({
+            "asset_id": asset_id,
+            "date": datetime.fromtimestamp(timestamp / 1000).isoformat(),
+            "clear_score": props.get("local_clear_score"),
+        })
+    return candidates
 
-    if exact_matches:
-        return exact_matches[0]
-    if nearest_candidate is not None:
-        return nearest_candidate[1], nearest_candidate[2]
-    return 0, images_info[0]
+
+def select_by_local_clarity(candidates: list[dict], row: pd.Series) -> dict | None:
+    """Pick the AOI-locally-clearest scene, breaking ties by date proximity.
+
+    Tries CLEAR_SCORE_TIERS in order (0.75 / 0.6 / 0.4) and returns the
+    closest-by-date candidate within the first tier that has any match. Falls
+    back to closest-by-date regardless of clarity if nothing ever clears 0.4.
+    """
+    if not candidates:
+        return None
+    row_date = parse_date_object(row.get("Date", ""))
+
+    def _closest(pool: list[dict]) -> dict | None:
+        if row_date is None:
+            return pool[0]
+        best: tuple[int, dict] | None = None
+        for c in pool:
+            c_date = parse_date_object(c.get("date", ""))
+            if c_date is None:
+                continue
+            distance = abs((c_date - row_date).days)
+            if best is None or distance < best[0]:
+                best = (distance, c)
+        return best[1] if best else None
+
+    for min_score in CLEAR_SCORE_TIERS:
+        pool = [c for c in candidates if c.get("clear_score") is not None and c["clear_score"] >= min_score]
+        if not pool:
+            continue
+        picked = _closest(pool)
+        if picked is not None:
+            return picked
+
+    return _closest([c for c in candidates if c.get("clear_score") is not None]) or (candidates[0] if candidates else None)
 
 
 def extract_window_band_means(
@@ -305,6 +453,23 @@ def _init_frame_from_csv(input_file: Path) -> pd.DataFrame:
     return frame
 
 
+def load_cluster_dates(root_dir: Path, cluster: str) -> list[str]:
+    """Unique ISO observation dates for sites in one cluster, across both summary files."""
+    dates: set[str] = set()
+    for filename in SUMMARY_FILES:
+        path = root_dir / filename
+        if not path.exists():
+            continue
+        frame = _init_frame_from_csv(path)
+        for _, row in frame.iterrows():
+            if site_cluster(str(row.get("Location", ""))) != cluster:
+                continue
+            parsed = parse_date_object(row.get("Date", ""))
+            if parsed is not None:
+                dates.add(parsed.date().isoformat())
+    return sorted(dates)
+
+
 def augment_with_planetscope(input_file: Path, folder_map: dict[str, list[Path]]) -> pd.DataFrame:
     """Load a summary CSV, attach PlanetScope band values from local rasters."""
     frame = _init_frame_from_csv(input_file)
@@ -350,47 +515,76 @@ def augment_with_sentinel2(
     input_file: Path,
     folder_map: dict[str, list[Path]],
     sentinel2_manager: Sentinel2Manager,
+    acolite_scenes: list[dict] | None = None,
 ) -> pd.DataFrame:
-    """Load a summary CSV, attach Sentinel-2 band values sampled from Earth Engine."""
+    """Load a summary CSV, attach Sentinel-2 band values.
+
+    Tries ACOLITE NetCDF output first (if `acolite_scenes` is given, from
+    scan_acolite_output), sampling directly at each point; falls back to GEE
+    (local-clarity scene selection) for any row ACOLITE didn't cover.
+    """
     frame = _init_frame_from_csv(input_file)
 
     feature_columns = list(SENTINEL2_BAND_COLUMNS) + list(SENTINEL2_INDEX_COLUMNS) + ["s2_scene_date"]
     for column in feature_columns:
         frame[column] = np.nan
     frame["s2_scene_date"] = ""
+    frame["s2_source"] = ""
 
     group_records = _group_rows_by_location_date(frame, folder_map)
 
     for (_, date_value), records in group_records.items():
         first_row = records[0]
-        date_start, date_end = format_date_window(first_row["date_value"], SENTINEL2_WINDOW_DAYS)
+        remaining = records
+
+        if acolite_scenes:
+            acolite_scene = select_acolite_scene(
+                acolite_scenes, first_row["date_value"], "S2", INDONESIA_S2_WINDOW_DAYS,
+            )
+            if acolite_scene:
+                still_needed = []
+                for r in remaining:
+                    sampled = sample_acolite_nc(
+                        acolite_scene["path"], r["longitude"], r["latitude"], ACOLITE_S2_BAND_MAP,
+                    )
+                    if sampled and not all(pd.isna(v) for v in sampled.values()):
+                        compute_sentinel2_indices(sampled)
+                        for column in SENTINEL2_BAND_COLUMNS + list(SENTINEL2_INDEX_COLUMNS):
+                            frame.at[r["row_index"], column] = sampled.get(column, np.nan)
+                        frame.at[r["row_index"], "s2_scene_date"] = parse_date_value(acolite_scene["date"])
+                        frame.at[r["row_index"], "s2_source"] = "acolite"
+                    else:
+                        still_needed.append(r)
+                remaining = still_needed
+
+        if not remaining:
+            continue
+
+        date_start, date_end = format_date_window(first_row["date_value"], INDONESIA_S2_WINDOW_DAYS)
         if not date_start or not date_end:
             continue
 
-        images_info = sentinel2_manager.retrieve_images(
-            first_row["latitude"], first_row["longitude"], date_start, date_end, 8,
+        candidates = _s2_local_clear_candidates(
+            first_row["longitude"], first_row["latitude"], date_start, date_end,
         )
-        if not images_info:
+        if not candidates:
             continue
 
-        selected = select_scene_info_by_date(images_info, pd.Series({"Date": first_row["date_value"]}))
+        selected = select_by_local_clarity(candidates, pd.Series({"Date": first_row["date_value"]}))
         if selected is None:
             continue
 
-        index, scene_info = selected
-        scene_date = parse_date_value(scene_info.get("date", ""))
-        image = sentinel2_manager.get_image_by_index(
-            first_row["latitude"], first_row["longitude"], date_start, date_end, index,
-        )
+        scene_date = parse_date_value(selected.get("date", ""))
+        image = sentinel2_manager.get_image_by_asset_id(selected["asset_id"])
         if image is None:
             continue
 
         region_features = [
             ee.Feature(
-                ee.Geometry.Point([r["longitude"], r["latitude"]]).buffer(15).bounds(),
+                ee.Geometry.Point([r["longitude"], r["latitude"]]).buffer(BAND_SAMPLE_BUFFER_M).bounds(),
                 {"row_index": r["row_index"]},
             )
-            for r in records
+            for r in remaining
         ]
         try:
             reduced = image.select(SENTINEL2_DOWNLOAD_BANDS).reduceRegions(
@@ -412,6 +606,7 @@ def augment_with_sentinel2(
             for column in SENTINEL2_BAND_COLUMNS + list(SENTINEL2_INDEX_COLUMNS):
                 frame.at[row_index, column] = feat.get(column, np.nan)
             frame.at[row_index, "s2_scene_date"] = feat.get("scene_date", "")
+            frame.at[row_index, "s2_source"] = "gee"
 
     return frame
 
@@ -420,47 +615,75 @@ def augment_with_landsat(
     input_file: Path,
     folder_map: dict[str, list[Path]],
     landsat_manager: LandsatManager,
+    acolite_scenes: list[dict] | None = None,
 ) -> pd.DataFrame:
-    """Load a summary CSV, attach Landsat band values sampled from Earth Engine."""
+    """Load a summary CSV, attach Landsat band values.
+
+    Tries ACOLITE NetCDF output first (if `acolite_scenes` is given, from
+    scan_acolite_output), sampling directly at each point; falls back to GEE
+    (local-clarity scene selection) for any row ACOLITE didn't cover.
+    """
     frame = _init_frame_from_csv(input_file)
 
     for column in LANDSAT_BAND_COLUMNS + LANDSAT_INDEX_COLUMNS:
         frame[column] = np.nan
     frame["ls_scene_date"] = ""
+    frame["ls_source"] = ""
 
     group_records = _group_rows_by_location_date(frame, folder_map)
 
     for (_, date_value), records in group_records.items():
         first_row = records[0]
-        date_start, date_end = format_date_window(first_row["date_value"], LANDSAT_WINDOW_DAYS)
+        remaining = records
+
+        if acolite_scenes:
+            acolite_scene = select_acolite_scene(
+                acolite_scenes, first_row["date_value"], "LS", INDONESIA_LS_WINDOW_DAYS,
+            )
+            if acolite_scene:
+                still_needed = []
+                for r in remaining:
+                    sampled = sample_acolite_nc(
+                        acolite_scene["path"], r["longitude"], r["latitude"], ACOLITE_LS_BAND_MAP,
+                    )
+                    if sampled and not all(pd.isna(v) for v in sampled.values()):
+                        compute_landsat_indices(sampled)
+                        for column in LANDSAT_BAND_COLUMNS + LANDSAT_INDEX_COLUMNS:
+                            frame.at[r["row_index"], column] = sampled.get(column, np.nan)
+                        frame.at[r["row_index"], "ls_scene_date"] = parse_date_value(acolite_scene["date"])
+                        frame.at[r["row_index"], "ls_source"] = "acolite"
+                    else:
+                        still_needed.append(r)
+                remaining = still_needed
+
+        if not remaining:
+            continue
+
+        date_start, date_end = format_date_window(first_row["date_value"], INDONESIA_LS_WINDOW_DAYS)
         if not date_start or not date_end:
             continue
 
-        images_info = landsat_manager.retrieve_images(
-            first_row["latitude"], first_row["longitude"], date_start, date_end, 8,
+        candidates = _landsat_local_clear_candidates(
+            first_row["longitude"], first_row["latitude"], date_start, date_end,
         )
-        if not images_info:
+        if not candidates:
             continue
 
-        selected = select_scene_info_by_date(images_info, pd.Series({"Date": first_row["date_value"]}))
+        selected = select_by_local_clarity(candidates, pd.Series({"Date": first_row["date_value"]}))
         if selected is None:
             continue
 
-        index, scene_info = selected
-        scene_date = parse_date_value(scene_info.get("date", ""))
-        image = landsat_manager.get_image_by_index(
-            first_row["latitude"], first_row["longitude"], date_start, date_end, index,
-        )
+        scene_date = parse_date_value(selected.get("date", ""))
+        image = landsat_manager.get_image_by_asset_id(selected["asset_id"])
         if image is None:
             continue
 
-        # Buffer of 45 m covers a 3×3 Landsat pixel neighbourhood (30 m pixels).
         region_features = [
             ee.Feature(
-                ee.Geometry.Point([r["longitude"], r["latitude"]]).buffer(45).bounds(),
+                ee.Geometry.Point([r["longitude"], r["latitude"]]).buffer(BAND_SAMPLE_BUFFER_M).bounds(),
                 {"row_index": r["row_index"]},
             )
-            for r in records
+            for r in remaining
         ]
         try:
             reduced = image.select(LANDSAT_DOWNLOAD_BANDS).reduceRegions(
@@ -482,6 +705,7 @@ def augment_with_landsat(
             for column in LANDSAT_BAND_COLUMNS + LANDSAT_INDEX_COLUMNS:
                 frame.at[row_index, column] = feat.get(column, np.nan)
             frame.at[row_index, "ls_scene_date"] = feat.get("ls_scene_date", "")
+            frame.at[row_index, "ls_source"] = "gee"
 
     return frame
 
@@ -538,10 +762,14 @@ def prepare_indonesia(
     root_dir: Path | str = DEFAULT_ROOT,
     output_suffix: str = "_with_bands",
     gee_project: str | None = None,
+    acolite_dir: Path | str | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """Prepare Indonesian site CSVs enriched with Landsat, Sentinel-2, and PlanetScope bands.
 
-    Returns (planetscope_combined, sentinel2_combined, landsat_combined).
+    If `acolite_dir` is given, Sentinel-2/Landsat band values are sampled from ACOLITE
+    NetCDF output there first (water-optimised atmospheric correction), falling back
+    to GEE for any row ACOLITE didn't cover. Returns
+    (planetscope_combined, sentinel2_combined, landsat_combined).
     """
     root_dir = Path(root_dir)
     if not root_dir.exists():
@@ -560,6 +788,12 @@ def prepare_indonesia(
     sentinel2_manager = Sentinel2Manager(gee_project=gee_project)
     landsat_manager = LandsatManager(gee_project=gee_project)
 
+    acolite_scenes: list[dict] = []
+    acolite_dir = Path(acolite_dir) if acolite_dir else None
+    if acolite_dir is not None and acolite_dir.exists():
+        acolite_scenes = scan_acolite_output(acolite_dir)
+        print(f"Indexed {len(acolite_scenes)} ACOLITE scenes in {acolite_dir}")
+
     folder_map = discover_imagery_folders(root_dir)
     if not folder_map:
         print(f"Warning: no PlanetScope imagery folders found under {root_dir}; skipping PlanetScope augmentation")
@@ -577,8 +811,8 @@ def prepare_indonesia(
         print(f"\nProcessing {filename}…")
         if folder_map:
             ps_frames.append((filename, augment_with_planetscope(input_file, folder_map)))
-        s2_frames.append((filename, augment_with_sentinel2(input_file, folder_map, sentinel2_manager)))
-        ls_frames.append((filename, augment_with_landsat(input_file, folder_map, landsat_manager)))
+        s2_frames.append((filename, augment_with_sentinel2(input_file, folder_map, sentinel2_manager, acolite_scenes)))
+        ls_frames.append((filename, augment_with_landsat(input_file, folder_map, landsat_manager, acolite_scenes)))
 
     ps_combined = build_combined_frame(ps_frames)
     s2_combined = build_combined_frame(s2_frames)
@@ -605,17 +839,106 @@ def prepare_indonesia(
     return ps_combined, s2_combined, ls_combined
 
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(
-        description="Prepare Indonesian seagrass CSVs with Landsat, Sentinel-2, and PlanetScope bands."
-    )
-    parser.add_argument("--root", type=str, default=str(DEFAULT_ROOT))
-    parser.add_argument("--output-suffix", type=str, default="_with_bands")
-    parser.add_argument("--gee-project", type=str, default=None)
-    args = parser.parse_args()
+def _cmd_dates(args) -> None:
+    root_dir = Path(args.root)
+    clusters = list(CLUSTER_LIMITS) if args.cluster == "all" else [args.cluster]
+    for cluster in clusters:
+        dates = load_cluster_dates(root_dir, cluster)
+        print(f"\n=== {cluster} ({CLUSTER_LIMITS[cluster]}) ===")
+        print(f"Unique observation dates: {len(dates)}")
+        s2_wins = merge_date_windows(dates, INDONESIA_S2_WINDOW_DAYS)
+        ls_wins = merge_date_windows(dates, INDONESIA_LS_WINDOW_DAYS)
+        print(f"S2 merged search windows (±{INDONESIA_S2_WINDOW_DAYS} days): {len(s2_wins)}")
+        print(f"LS merged search windows (±{INDONESIA_LS_WINDOW_DAYS} days): {len(ls_wins)}")
 
-    ps_out, s2_out, ls_out = prepare_indonesia(
+
+def _cmd_download(args) -> None:
+    root_dir = Path(args.root)
+    limit = CLUSTER_LIMITS[args.cluster]
+    dates = load_cluster_dates(root_dir, args.cluster)
+    scenes_dir = Path(args.scenes)
+    scenes_dir.mkdir(parents=True, exist_ok=True)
+    if args.cdse_user and args.cdse_pass:
+        download_sentinel2(dates, scenes_dir, args.cdse_user, args.cdse_pass,
+                            limit=limit, window_days=INDONESIA_S2_WINDOW_DAYS)
+    else:
+        print("Skipping Sentinel-2 (no --cdse-user / --cdse-pass)")
+    if args.usgs_user and args.usgs_token:
+        download_landsat(dates, scenes_dir, args.usgs_user, args.usgs_token,
+                          limit=limit, window_days=INDONESIA_LS_WINDOW_DAYS)
+    else:
+        print("Skipping Landsat (no --usgs-user / --usgs-token)")
+
+
+def _cmd_acolite(args) -> None:
+    run_acolite_batch(
+        scenes_dir=Path(args.scenes),
+        output_dir=Path(args.acolite_out),
+        limit=CLUSTER_LIMITS[args.cluster],
+        acolite_path=Path(args.acolite_repo),
+    )
+
+
+def _cmd_build(args) -> None:
+    prepare_indonesia(
         root_dir=Path(args.root),
         output_suffix=args.output_suffix,
         gee_project=args.gee_project,
+        acolite_dir=Path(args.acolite_dir) if args.acolite_dir else None,
     )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Indonesian seagrass site pipeline (Landsat, Sentinel-2, PlanetScope).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Sites fall into two clusters ~200km apart:\n"
+            "  bawean  : Cinta, Jerat Lanjeng, Pamasaran, Pasir Putih, Somor-somor\n"
+            "  baluran : Pantai Bama (4 stations)\n"
+            "Run 'python seagrass/indonesia.py <command> --help' for per-command options."
+        ),
+    )
+    sub = parser.add_subparsers(dest="cmd", metavar="<command>")
+
+    # dates
+    p = sub.add_parser("dates", help="Show observation date summary and bounding box per cluster")
+    p.add_argument("--root", default=str(DEFAULT_ROOT))
+    p.add_argument("--cluster", choices=["bawean", "baluran", "all"], default="all")
+
+    # download
+    p = sub.add_parser("download", help="Download Level-1 scenes from CDSE / USGS for one cluster")
+    p.add_argument("--root", default=str(DEFAULT_ROOT))
+    p.add_argument("--cluster", choices=["bawean", "baluran"], required=True)
+    p.add_argument("--scenes", required=True, help="Directory to save downloaded scenes")
+    p.add_argument("--cdse-user", metavar="EMAIL")
+    p.add_argument("--cdse-pass", metavar="PASSWORD")
+    p.add_argument("--usgs-user", metavar="USERNAME")
+    p.add_argument("--usgs-token", metavar="TOKEN")
+
+    # acolite
+    p = sub.add_parser("acolite", help="Run ACOLITE on downloaded scenes for one cluster")
+    p.add_argument("--scenes", required=True)
+    p.add_argument("--acolite-out", required=True, help="Output directory for NetCDF files")
+    p.add_argument("--cluster", choices=["bawean", "baluran"], required=True)
+    p.add_argument("--acolite-repo", default=str(ACOLITE_REPO_PATH))
+
+    # build
+    p = sub.add_parser("build", help="Build the CSVs from summary sheets + imagery bands")
+    p.add_argument("--root", type=str, default=str(DEFAULT_ROOT))
+    p.add_argument("--output-suffix", type=str, default="_with_bands")
+    p.add_argument("--gee-project", type=str, default=None)
+    p.add_argument("--acolite-dir", metavar="DIR",
+                   help="Directory of ACOLITE NetCDF output for BOTH clusters (primary imagery source)")
+
+    args = parser.parse_args()
+    dispatch = {
+        "dates": _cmd_dates,
+        "download": _cmd_download,
+        "acolite": _cmd_acolite,
+        "build": _cmd_build,
+    }
+    if args.cmd in dispatch:
+        dispatch[args.cmd](args)
+    else:
+        parser.print_help()

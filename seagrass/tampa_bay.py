@@ -14,7 +14,11 @@ Full pipeline (run steps in order, or combine flags to do them all at once):
   python seagrass/tampa_bay.py acolite \\
       --scenes /raw_scenes/ --acolite-out /acolite_out/
 
-  # 4. Build the CSV (uses ACOLITE output; falls back to GEE if scenes are absent)
+  # 4. Build the CSVs (uses ACOLITE output; falls back to GEE if scenes are absent).
+  #    Writes two files — tampa_transects_sentinel2_with_bands.csv and
+  #    tampa_transects_landsat_with_bands.csv — from the -o base name.
+  #    --gee-project can be omitted if gee_project is set in
+  #    common/credentials.json.
   python seagrass/tampa_bay.py build --root data/ \\
       --acolite-dir /acolite_out/ --gee-project my-gee-project \\
       -o tampa_transects_with_bands.csv
@@ -43,17 +47,17 @@ Sentinel-2 : https://dataspace.copernicus.eu  (free)
 Landsat     : https://ers.cr.usgs.gov          (free, generate Application Token
               in your profile under "Access" → "Create Application Token")
 ACOLITE     : git clone https://github.com/acolite/acolite
-              pip install -r acolite/requirements.txt
-              Set ACOLITE_REPO_PATH below.
+              ACOLITE has no requirements.txt (only a conda environment.yml);
+              its dependencies (pyresample, cartopy, gdal, h5py, pygrib,
+              scikit-image, zarr, fsspec, aiohttp) are already declared in
+              this project's pyproject.toml, so `uv sync` covers them.
+              Set ACOLITE_REPO_PATH below to point at the clone.
 """
 
 from __future__ import annotations
 
 import json
 import re
-import sys
-import time
-from datetime import date, timedelta
 from pathlib import Path
 
 import argparse
@@ -62,11 +66,11 @@ import numpy as np
 import pandas as pd
 
 from common.common import format_date_window, parse_date_object, parse_date_value
+from common.credentials import load_credentials
 from common.sentinel import (
     SENTINEL2_BAND_COLUMNS,
     SENTINEL2_DOWNLOAD_BANDS,
     SENTINEL2_INDEX_COLUMNS,
-    SENTINEL2_WINDOW_DAYS,
     build_sentinel2_feature_values,
     compute_sentinel2_indices,
 )
@@ -74,7 +78,6 @@ from common.landsat import (
     LANDSAT_BAND_COLUMNS,
     LANDSAT_DOWNLOAD_BANDS,
     LANDSAT_INDEX_COLUMNS,
-    LANDSAT_WINDOW_DAYS,
     build_landsat_feature_values,
     compute_landsat_indices,
 )
@@ -92,36 +95,34 @@ from common.depth_correction import (
     add_lyzenga_columns,
     add_depth_corrected_columns,
 )
-
-
-# --------------------------------------------------------------------------- #
-# >>>  SET THIS to the absolute path of your cloned acolite repository.       #
-ACOLITE_REPO_PATH = Path.home() / "Documents" / "acolite"
-# --------------------------------------------------------------------------- #
+from common.acolite_pipeline import (
+    ACOLITE_REPO_PATH,
+    ACOLITE_S2_BAND_MAP,
+    ACOLITE_LS_BAND_MAP,
+    merge_date_windows,
+    download_sentinel2,
+    download_landsat,
+    run_acolite_batch,
+    scan_acolite_output,
+    select_acolite_scene,
+    sample_acolite_nc,
+)
 
 DEFAULT_ROOT = Path(".")
 ENDPOINTS_FILE = "transect_endpoints.csv"
 JSON_FILE = "tb_seagrass_transects.json"
 
-# ACOLITE rhos variable → CSV column name
-ACOLITE_S2_BAND_MAP: dict[str, str] = {
-    "rhos_443": "s2_b1", "rhos_492": "s2_b2", "rhos_560": "s2_b3",
-    "rhos_665": "s2_b4", "rhos_704": "s2_b5", "rhos_740": "s2_b6",
-    "rhos_783": "s2_b7", "rhos_842": "s2_b8", "rhos_865": "s2_b8a",
-    "rhos_1614": "s2_b11", "rhos_2202": "s2_b12",
-}
-ACOLITE_LS_BAND_MAP: dict[str, str] = {
-    "rhos_443": "ls_b1", "rhos_482": "ls_b2", "rhos_561": "ls_b3",
-    "rhos_655": "ls_b4", "rhos_865": "ls_b5", "rhos_1609": "ls_b6",
-    "rhos_2201": "ls_b7",
-}
-
 # Tampa Bay bounding box (±0.05° buffer around transect extent).
 # ACOLITE limit format: [south, west, north, east]
 TAMPA_BAY_LIMIT = [27.448, -82.862, 28.050, -82.343]
 
+# Wider than common/sentinel.py's and common/landsat.py's defaults (15 / 30 days):
+# Tampa Bay's frequent cloud cover often leaves a narrow window with zero scenes
+# under MAX_CLOUD_COVER, so search wider and take whichever scene is closest by date.
+TAMPA_S2_WINDOW_DAYS = 60
+TAMPA_LS_WINDOW_DAYS = 60
+
 _ABUNDANCE_CODE_RE = re.compile(r"^([\d.]+)")
-_DATE_RE = re.compile(r"(\d{4})[_\-](\d{2})[_\-](\d{2})")
 
 
 # ===========================================================================
@@ -221,369 +222,6 @@ def _load_observation_dates(json_path: Path) -> list[str]:
     return sorted(dates)
 
 
-def _merge_date_windows(dates: list[str], window_days: int) -> list[tuple[str, str]]:
-    """Collapse observation dates into merged search windows (reduces API calls)."""
-    parsed = sorted({date.fromisoformat(d) for d in dates})
-    if not parsed:
-        return []
-    delta = timedelta(days=window_days)
-    windows: list[tuple[date, date]] = []
-    cur_s, cur_e = parsed[0] - delta, parsed[0] + delta
-    for d in parsed[1:]:
-        ns, ne = d - delta, d + delta
-        if ns <= cur_e:
-            cur_e = max(cur_e, ne)
-        else:
-            windows.append((cur_s, cur_e))
-            cur_s, cur_e = ns, ne
-    windows.append((cur_s, cur_e))
-    return [(s.isoformat(), e.isoformat()) for s, e in windows]
-
-
-# ===========================================================================
-# Section 2 — Scene downloads
-# ===========================================================================
-
-def _download_file(session, url: str, dest: Path) -> None:
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(".tmp")
-    with session.get(url, stream=True, timeout=300) as r:
-        r.raise_for_status()
-        total = int(r.headers.get("content-length", 0))
-        downloaded = 0
-        with open(tmp, "wb") as fh:
-            for chunk in r.iter_content(chunk_size=1024 * 1024):
-                fh.write(chunk)
-                downloaded += len(chunk)
-                if total:
-                    print(f"\r    {dest.name}: {100*downloaded/total:.0f}%",
-                          end="", flush=True)
-    tmp.rename(dest)
-    print(f"\r    {dest.name}: done          ")
-
-
-def _cdse_token(username: str, password: str) -> str:
-    import requests
-    resp = requests.post(
-        "https://identity.dataspace.copernicus.eu/auth/realms/CDSE"
-        "/protocol/openid-connect/token",
-        data={"grant_type": "password", "username": username,
-              "password": password, "client_id": "cdse-public"},
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()["access_token"]
-
-
-def download_sentinel2(
-    dates: list[str],
-    scenes_dir: Path,
-    username: str,
-    password: str,
-    limit: list[float] = TAMPA_BAY_LIMIT,
-) -> int:
-    import requests
-
-    print("\n=== Sentinel-2 download (Copernicus Data Space) ===")
-    token = _cdse_token(username, password)
-    s2_dates = [d for d in dates if d >= "2015-07-01"]
-    windows = _merge_date_windows(s2_dates, SENTINEL2_WINDOW_DAYS)
-    print(f"Searching {len(windows)} merged date window(s) …")
-
-    south, west, north, east = limit
-    wkt = (f"POLYGON(({west} {south},{east} {south},"
-           f"{east} {north},{west} {north},{west} {south}))")
-
-    session = requests.Session()
-    session.headers["Authorization"] = f"Bearer {token}"
-
-    seen: set[str] = set()
-    n = 0
-    for date_start, date_end in windows:
-        params = {
-            "$filter": (
-                "Collection/Name eq 'SENTINEL-2' "
-                "and Attributes/OData.CSC.StringAttribute/any("
-                "att:att/Name eq 'productType' "
-                "and att/OData.CSC.StringAttribute/Value eq 'S2MSI1C') "
-                f"and OData.CSC.Intersects(area=geography'SRID=4326;{wkt}') "
-                f"and ContentDate/Start ge {date_start}T00:00:00.000Z "
-                f"and ContentDate/Start le {date_end}T23:59:59.000Z"
-            ),
-            "$orderby": "ContentDate/Start",
-            "$top": 100,
-        }
-        resp = session.get(
-            "https://catalogue.dataspace.copernicus.eu/odata/v1/Products",
-            params=params, timeout=60,
-        )
-        resp.raise_for_status()
-        for product in resp.json().get("value", []):
-            pid = product["Id"]
-            if pid in seen:
-                continue
-            seen.add(pid)
-            dest = scenes_dir / f"{product['Name']}.zip"
-            print(f"  {product['Name']}")
-            # Refresh token per download (they expire after 10 min)
-            session.headers["Authorization"] = f"Bearer {_cdse_token(username, password)}"
-            _download_file(
-                session,
-                f"https://zipper.dataspace.copernicus.eu/odata/v1/Products({pid})/$value",
-                dest,
-            )
-            n += 1
-            time.sleep(0.5)
-
-    print(f"Sentinel-2: {n} scene(s) → {scenes_dir}")
-    return n
-
-
-_M2M = "https://m2m.cr.usgs.gov/api/api/json/stable"
-_LS_DATASETS = [
-    "landsat_ot_c2_l1",    # Landsat 8/9
-    "landsat_etm_c2_l1",   # Landsat 7
-    "landsat_tm_c2_l1",    # Landsat 4/5
-]
-
-
-def _m2m(session, endpoint: str, payload: dict) -> dict:
-    resp = session.post(f"{_M2M}/{endpoint}", json=payload, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("errorCode"):
-        raise RuntimeError(f"M2M {data['errorCode']}: {data.get('errorMessage')}")
-    return data.get("data") or {}
-
-
-def download_landsat(
-    dates: list[str],
-    scenes_dir: Path,
-    username: str,
-    token: str,
-    limit: list[float] = TAMPA_BAY_LIMIT,
-) -> int:
-    import requests
-
-    print("\n=== Landsat download (USGS M2M) ===")
-    session = requests.Session()
-    api_key = _m2m(session, "login-token", {"username": username, "token": token})
-    session.headers["X-Auth-Token"] = api_key
-    print("  Logged in to USGS M2M")
-
-    south, west, north, east = limit
-    windows = _merge_date_windows(dates, LANDSAT_WINDOW_DAYS)
-    print(f"Searching {len(windows)} merged date window(s) …")
-
-    to_dl: list[dict] = []
-    seen: set[str] = set()
-    for ds_name in _LS_DATASETS:
-        for date_start, date_end in windows:
-            result = _m2m(session, "scene-search", {
-                "datasetName": ds_name,
-                "spatialFilter": {
-                    "filterType": "mbr",
-                    "lowerLeft": {"latitude": south, "longitude": west},
-                    "upperRight": {"latitude": north, "longitude": east},
-                },
-                "acquisitionFilter": {"start": date_start, "end": date_end},
-                "maxResults": 50,
-                "useCustomization": False,
-            })
-            for scene in result.get("results") or []:
-                eid = scene["entityId"]
-                if eid in seen:
-                    continue
-                seen.add(eid)
-                to_dl.append({"entityId": eid, "dataset": ds_name,
-                               "displayId": scene.get("displayId", eid)})
-
-    print(f"  Found {len(to_dl)} unique scene(s)")
-    n = 0
-    for i in range(0, len(to_dl), 20):
-        batch = to_dl[i: i + 20]
-        opts = _m2m(session, "download-options", {
-            "datasetName": batch[0]["dataset"],
-            "entityIds": [s["entityId"] for s in batch],
-        })
-        downloads = [
-            {"entityId": p["entityId"], "productId": p["id"]}
-            for p in (opts or [])
-            if p.get("downloadSystem") == "dds" and "Bundle" in p.get("productName", "")
-        ]
-        if not downloads:
-            continue
-        url_result = _m2m(session, "download-request", {"downloads": downloads})
-        for item in url_result.get("availableDownloads") or []:
-            url = item.get("url")
-            did = item.get("displayId", item.get("entityId", "scene"))
-            dest = scenes_dir / f"{did}.tar"
-            if dest.exists():
-                print(f"    already downloaded: {did}")
-                continue
-            print(f"  {did}")
-            _download_file(session, url, dest)
-            n += 1
-            time.sleep(0.5)
-
-    _m2m(session, "logout", {})
-    print(f"Landsat: {n} scene(s) → {scenes_dir}")
-    return n
-
-
-# ===========================================================================
-# Section 3 — ACOLITE runner
-# ===========================================================================
-
-def _find_scenes(scenes_dir: Path) -> list[Path]:
-    found: list[Path] = []
-    for entry in sorted(scenes_dir.iterdir()):
-        name = entry.name.upper()
-        if entry.is_file() and entry.suffix.lower() in {".zip", ".tar", ".gz"}:
-            found.append(entry)
-        elif entry.is_dir() and (name.endswith(".SAFE") or name.startswith("LC0")):
-            found.append(entry)
-    return found
-
-
-def run_acolite_batch(
-    scenes_dir: Path,
-    output_dir: Path,
-    acolite_path: Path = ACOLITE_REPO_PATH,
-    limit: list[float] = TAMPA_BAY_LIMIT,
-) -> None:
-    """Run ACOLITE on every scene in scenes_dir, writing NetCDF to output_dir."""
-    if not acolite_path.exists():
-        raise FileNotFoundError(
-            f"ACOLITE repo not found at {acolite_path}.\n"
-            "Clone it:  git clone https://github.com/acolite/acolite\n"
-            f"Then set ACOLITE_REPO_PATH at the top of {__file__}."
-        )
-    if str(acolite_path) not in sys.path:
-        sys.path.insert(0, str(acolite_path))
-    try:
-        import acolite as ac
-    except ImportError as exc:
-        raise ImportError(
-            f"Could not import acolite from {acolite_path}: {exc}\n"
-            "Install its dependencies:  pip install -r acolite/requirements.txt"
-        ) from exc
-
-    output_dir.mkdir(parents=True, exist_ok=True)
-    scenes = _find_scenes(scenes_dir)
-    if not scenes:
-        print(f"No scenes found in {scenes_dir}")
-        return
-
-    print(f"\n=== ACOLITE processing: {len(scenes)} scene(s) ===")
-    settings_base: dict = {
-        "limit": limit,
-        "l2w_parameters": ["rhos"],   # write all rhos_* surface-reflectance bands
-        "s2_target_res": 10,          # resample all S2 bands to 10 m
-        "glint_correction": True,     # sun glint correction
-        "dsf_aot_estimate": "tiled",  # dark-spectrum fitting, tile-based
-        "merge_tiles": True,          # merge adjacent S2 tiles
-    }
-    for scene_path in scenes:
-        print(f"\nProcessing {scene_path.name} …")
-        try:
-            ac.acolite_run(settings={
-                **settings_base,
-                "inputfile": str(scene_path),
-                "output": str(output_dir),
-            })
-            print(f"  OK → {output_dir}")
-        except Exception as exc:
-            print(f"  FAILED: {exc}")
-
-
-# ===========================================================================
-# Section 4 — ACOLITE scene sampling
-# ===========================================================================
-
-def _detect_acolite_sensor(nc_path: Path) -> str | None:
-    name = nc_path.stem.upper()
-    if any(t in name for t in ("S2A", "S2B", "MSI", "SENTINEL2", "SENTINEL-2")):
-        return "S2"
-    if any(t in name for t in ("L8", "L9", "LC08", "LC09", "LANDSAT", "OLI")):
-        return "LS"
-    return None
-
-
-def scan_acolite_output(acolite_dir: Path) -> list[dict]:
-    scenes: list[dict] = []
-    for nc_file in sorted(acolite_dir.glob("**/*.nc")):
-        m = _DATE_RE.search(nc_file.name)
-        if not m:
-            continue
-        sensor = _detect_acolite_sensor(nc_file)
-        if sensor is None:
-            continue
-        scenes.append({
-            "path": nc_file,
-            "date": f"{m.group(1)}-{m.group(2)}-{m.group(3)}",
-            "sensor": sensor,
-        })
-    return scenes
-
-
-def _select_acolite_scene(
-    scenes: list[dict], obs_date: str, sensor: str, max_days: int
-) -> dict | None:
-    obs_dt = parse_date_object(obs_date)
-    if obs_dt is None:
-        return None
-    best: tuple[int, dict] | None = None
-    for scene in scenes:
-        if scene["sensor"] != sensor:
-            continue
-        scene_dt = parse_date_object(scene["date"])
-        if scene_dt is None:
-            continue
-        dist = abs((scene_dt - obs_dt).days)
-        if dist <= max_days and (best is None or dist < best[0]):
-            best = (dist, scene)
-    return best[1] if best else None
-
-
-def _sample_acolite_nc(
-    nc_path: Path, lon: float, lat: float, band_map: dict[str, str]
-) -> dict[str, float]:
-    try:
-        import xarray as xr
-    except ImportError:
-        print("Warning: xarray not installed; ACOLITE sampling unavailable.")
-        return {}
-    try:
-        ds = xr.open_dataset(nc_path, mask_and_scale=True)
-    except Exception as exc:
-        print(f"Warning: could not open {nc_path.name}: {exc}")
-        return {}
-
-    lat_dim = next((d for d in ("lat", "y") if d in ds.coords), None)
-    lon_dim = next((d for d in ("lon", "x") if d in ds.coords), None)
-    result: dict[str, float] = {}
-    try:
-        for rhos_var, csv_col in band_map.items():
-            if rhos_var not in ds:
-                result[csv_col] = np.nan
-                continue
-            da = ds[rhos_var]
-            if lat_dim and lon_dim:
-                try:
-                    val = float(da.sel({lat_dim: lat, lon_dim: lon},
-                                       method="nearest").values)
-                except Exception:
-                    val = np.nan
-            else:
-                val = np.nan
-            result[csv_col] = val if not np.isnan(val) else np.nan
-    except Exception as exc:
-        print(f"Warning: sampling error in {nc_path.name}: {exc}")
-    finally:
-        ds.close()
-    return result
-
 
 # ===========================================================================
 # Section 5 — GEE sampling (fallback)
@@ -620,7 +258,9 @@ def _sample_gee_point(
     date_start, date_end = format_date_window(obs_date, window_days)
     if not date_start or not date_end:
         return None
-    images_info = manager.retrieve_images(latitude, longitude, date_start, date_end, 8)
+    # Wide window (60 days) can hold more than a handful of scenes; ask for enough
+    # candidates that the closest-by-date one isn't cut off by the cloud-cover sort.
+    images_info = manager.retrieve_images(latitude, longitude, date_start, date_end, 24)
     if not images_info:
         return None
     idx, scene_info = _select_scene_by_date(images_info, obs_date)
@@ -674,13 +314,30 @@ def _apply_corrections(frame, row_index, band_cols, depth_m, kd_map, drc_cols,
         frame.at[row_index, col] = lyz.get(col, np.nan)
 
 
+def _sensor_output_path(output_file: Path, sensor: str) -> Path:
+    """tampa_transects_with_bands.csv -> tampa_transects_<sensor>_with_bands.csv"""
+    stem = output_file.stem
+    suffix = output_file.suffix or ".csv"
+    if stem.endswith("_with_bands"):
+        stem = f"{stem[: -len('_with_bands')]}_{sensor}_with_bands"
+    else:
+        stem = f"{stem}_{sensor}"
+    return output_file.with_name(stem + suffix)
+
+
 def build_transect_csv(
     root_dir: Path,
     output_file: Path,
     gee_project: str | None = None,
     acolite_dir: Path | None = None,
-    sentinel2_window_days: int = SENTINEL2_WINDOW_DAYS,
-) -> pd.DataFrame:
+    sentinel2_window_days: int = TAMPA_S2_WINDOW_DAYS,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Build the Tampa Bay transect dataset.
+
+    Writes two CSVs (Sentinel-2 and Landsat, each with the shared observation
+    columns) next to `output_file`, in the same one-CSV-per-sensor style as
+    seagrass/indonesia.py.  Returns (sentinel2_frame, landsat_frame).
+    """
     for required in (root_dir / ENDPOINTS_FILE, root_dir / JSON_FILE):
         if not required.exists():
             raise FileNotFoundError(f"Required file not found: {required}")
@@ -696,13 +353,22 @@ def build_transect_csv(
         acolite_scenes = scan_acolite_output(acolite_dir)
         print(f"Indexed {len(acolite_scenes)} ACOLITE scenes in {acolite_dir}")
 
+    if gee_project is None:
+        try:
+            gee_project = load_credentials().get("gee_project")
+        except FileNotFoundError:
+            gee_project = None
+
     s2_mgr: Sentinel2Manager | None = None
     ls_mgr: LandsatManager | None = None
     if gee_project:
         s2_mgr = Sentinel2Manager(gee_project=gee_project)
         ls_mgr = LandsatManager(gee_project=gee_project)
 
-    for row_index, row in frame.iterrows():
+    s2_hits = 0
+    ls_hits = 0
+    pbar = tqdm(frame.iterrows(), total=len(frame), desc="Sampling imagery", unit="obs")
+    for row_index, row in pbar:
         lon = float(row["longitude"])
         lat = float(row["latitude"])
         obs_date = str(row["observation_date"]).strip()
@@ -715,9 +381,9 @@ def build_transect_csv(
         s2_date = ""
         s2_src = ""
 
-        s2_scene = _select_acolite_scene(acolite_scenes, obs_date, "S2", sentinel2_window_days)
+        s2_scene = select_acolite_scene(acolite_scenes, obs_date, "S2", sentinel2_window_days)
         if s2_scene:
-            sampled = _sample_acolite_nc(s2_scene["path"], lon, lat, ACOLITE_S2_BAND_MAP)
+            sampled = sample_acolite_nc(s2_scene["path"], lon, lat, ACOLITE_S2_BAND_MAP)
             if sampled:
                 s2_feat = sampled
                 compute_sentinel2_indices(s2_feat)
@@ -739,15 +405,16 @@ def build_transect_csv(
             frame.at[row_index, "s2_source"] = s2_src
             _apply_corrections(frame, row_index, SENTINEL2_BAND_COLUMNS, depth_m,
                                 S2_KD, S2_DRC_COLUMNS, S2_LYZENGA_PAIRS, S2_LYZENGA_COLUMNS)
+            s2_hits += 1
 
         # Landsat
         ls_feat: dict | None = None
         ls_date = ""
         ls_src = ""
 
-        ls_scene = _select_acolite_scene(acolite_scenes, obs_date, "LS", LANDSAT_WINDOW_DAYS)
+        ls_scene = select_acolite_scene(acolite_scenes, obs_date, "LS", TAMPA_LS_WINDOW_DAYS)
         if ls_scene:
-            sampled = _sample_acolite_nc(ls_scene["path"], lon, lat, ACOLITE_LS_BAND_MAP)
+            sampled = sample_acolite_nc(ls_scene["path"], lon, lat, ACOLITE_LS_BAND_MAP)
             if sampled:
                 ls_feat = sampled
                 compute_landsat_indices(ls_feat)
@@ -756,7 +423,7 @@ def build_transect_csv(
 
         if not ls_feat and ls_mgr:
             ls_feat = _sample_gee_point(ls_mgr, lon, lat, obs_date,
-                                         LANDSAT_WINDOW_DAYS, LANDSAT_DOWNLOAD_BANDS,
+                                         TAMPA_LS_WINDOW_DAYS, LANDSAT_DOWNLOAD_BANDS,
                                          30, 45, build_landsat_feature_values)
             if ls_feat:
                 ls_date = ls_feat.get("ls_scene_date", "")
@@ -770,9 +437,22 @@ def build_transect_csv(
             _apply_corrections(frame, row_index, LANDSAT_BAND_COLUMNS, depth_m,
                                 LS_KD, LS_DRC_COLUMNS, LS_LYZENGA_PAIRS, LS_LYZENGA_COLUMNS)
 
-    frame.to_csv(output_file, index=False)
-    print(f"Wrote {output_file}")
-    return frame
+    s2_only_cols = (SENTINEL2_BAND_COLUMNS + list(SENTINEL2_INDEX_COLUMNS)
+                    + ["s2_scene_date", "s2_source"] + S2_DRC_COLUMNS + S2_LYZENGA_COLUMNS)
+    ls_only_cols = (LANDSAT_BAND_COLUMNS + LANDSAT_INDEX_COLUMNS
+                    + ["ls_scene_date", "ls_source"] + LS_DRC_COLUMNS + LS_LYZENGA_COLUMNS)
+    shared_cols = [c for c in frame.columns if c not in s2_only_cols + ls_only_cols]
+
+    s2_frame = frame[shared_cols + s2_only_cols]
+    ls_frame = frame[shared_cols + ls_only_cols]
+
+    s2_out = _sensor_output_path(output_file, "sentinel2")
+    ls_out = _sensor_output_path(output_file, "landsat")
+    s2_frame.to_csv(s2_out, index=False)
+    print(f"Wrote {s2_out}")
+    ls_frame.to_csv(ls_out, index=False)
+    print(f"Wrote {ls_out}")
+    return s2_frame, ls_frame
 
 
 # ===========================================================================
@@ -790,18 +470,10 @@ def _cmd_dates(args) -> None:
     print(f"Sentinel-2 tile: T17RNH (and partial T17RMH)")
     print(f"Landsat path/row: 17/41")
     print()
-    s2_wins = _merge_date_windows(s2_dates, SENTINEL2_WINDOW_DAYS)
-    ls_wins = _merge_date_windows(dates, LANDSAT_WINDOW_DAYS)
-    print(f"S2 merged search windows (±{SENTINEL2_WINDOW_DAYS} days): {len(s2_wins)}")
-    print(f"LS merged search windows (±{LANDSAT_WINDOW_DAYS} days): {len(ls_wins)}")
-    if args.output:
-        Path(args.output).write_text("\n".join(dates) + "\n", encoding="utf-8")
-        print(f"\nDate list saved to {args.output}")
-    else:
-        print()
-        for d in dates:
-            print(f"  {d}")
-        print("\n(Use --output dates.txt to save to a file)")
+    s2_wins = merge_date_windows(s2_dates, TAMPA_S2_WINDOW_DAYS)
+    ls_wins = merge_date_windows(dates, TAMPA_LS_WINDOW_DAYS)
+    print(f"S2 merged search windows (±{TAMPA_S2_WINDOW_DAYS} days): {len(s2_wins)}")
+    print(f"LS merged search windows (±{TAMPA_LS_WINDOW_DAYS} days): {len(ls_wins)}")
 
 
 def _cmd_download(args) -> None:
@@ -809,11 +481,13 @@ def _cmd_download(args) -> None:
     scenes_dir = Path(args.scenes)
     scenes_dir.mkdir(parents=True, exist_ok=True)
     if args.cdse_user and args.cdse_pass:
-        download_sentinel2(dates, scenes_dir, args.cdse_user, args.cdse_pass)
+        download_sentinel2(dates, scenes_dir, args.cdse_user, args.cdse_pass,
+                            limit=TAMPA_BAY_LIMIT, window_days=TAMPA_S2_WINDOW_DAYS)
     else:
         print("Skipping Sentinel-2 (no --cdse-user / --cdse-pass)")
     if args.usgs_user and args.usgs_token:
-        download_landsat(dates, scenes_dir, args.usgs_user, args.usgs_token)
+        download_landsat(dates, scenes_dir, args.usgs_user, args.usgs_token,
+                          limit=TAMPA_BAY_LIMIT, window_days=TAMPA_LS_WINDOW_DAYS)
     else:
         print("Skipping Landsat (no --usgs-user / --usgs-token)")
 
@@ -822,6 +496,7 @@ def _cmd_acolite(args) -> None:
     run_acolite_batch(
         scenes_dir=Path(args.scenes),
         output_dir=Path(args.acolite_out),
+        limit=TAMPA_BAY_LIMIT,
         acolite_path=Path(args.acolite_repo),
     )
 
@@ -847,6 +522,7 @@ def _cmd_all(args) -> None:
         run_acolite_batch(
             scenes_dir=scenes_dir,
             output_dir=acolite_out,
+            limit=TAMPA_BAY_LIMIT,
             acolite_path=Path(args.acolite_repo),
         )
 
@@ -870,7 +546,6 @@ if __name__ == "__main__":
     # dates
     p = sub.add_parser("dates", help="Show observation date summary and bounding box")
     p.add_argument("--root", default="data")
-    p.add_argument("--output", metavar="FILE", help="Save date list to file")
 
     # download
     p = sub.add_parser("download", help="Download Level-1 scenes from CDSE / USGS")
@@ -890,11 +565,13 @@ if __name__ == "__main__":
     # build
     p = sub.add_parser("build", help="Build the CSV from JSON + imagery bands")
     p.add_argument("--root", default="data")
-    p.add_argument("--output", "-o", default="tampa_transects_with_bands.csv")
-    p.add_argument("--gee-project", metavar="PROJECT")
+    p.add_argument("--output", "-o", default="tampa_transects_with_bands.csv",
+                   help="Base filename; writes <base>_sentinel2<suffix> and <base>_landsat<suffix>")
+    p.add_argument("--gee-project", metavar="PROJECT",
+                   help="Defaults to gee_project in common/credentials.json if omitted")
     p.add_argument("--acolite-dir", metavar="DIR",
                    help="Directory of ACOLITE NetCDF output (primary imagery source)")
-    p.add_argument("--s2-window-days", type=int, default=SENTINEL2_WINDOW_DAYS)
+    p.add_argument("--s2-window-days", type=int, default=TAMPA_S2_WINDOW_DAYS)
 
     # all
     p = sub.add_parser("all", help="Run the full pipeline in one go")
@@ -906,9 +583,11 @@ if __name__ == "__main__":
     p.add_argument("--cdse-pass", metavar="PASSWORD")
     p.add_argument("--usgs-user", metavar="USERNAME")
     p.add_argument("--usgs-token", metavar="TOKEN")
-    p.add_argument("--gee-project", metavar="PROJECT")
-    p.add_argument("--output", "-o", default="tampa_transects_with_bands.csv")
-    p.add_argument("--s2-window-days", type=int, default=SENTINEL2_WINDOW_DAYS)
+    p.add_argument("--gee-project", metavar="PROJECT",
+                   help="Defaults to gee_project in common/credentials.json if omitted")
+    p.add_argument("--output", "-o", default="tampa_transects_with_bands.csv",
+                   help="Base filename; writes <base>_sentinel2<suffix> and <base>_landsat<suffix>")
+    p.add_argument("--s2-window-days", type=int, default=TAMPA_S2_WINDOW_DAYS)
 
     args = parser.parse_args()
     dispatch = {
