@@ -350,9 +350,12 @@ seagrass observation records, producing analysis-ready CSVs. Run via `seagrass.p
 
 ```bash
 uv run python seagrass.py --site indonesia <root_dir> [--output-suffix _with_bands] [--gee-project <id>]
-uv run python seagrass.py --site tampabay  <root_dir> [--output <file.csv>]     [--gee-project <id>] \
-  [--survey-date-column <col>] [--planetscope-raster-dir <dir>]
+uv run python seagrass.py --site tampabay  <root_dir> [--output <file.csv>] [--gee-project <id>] \
+  [--acolite-dir <dir>] [--s2-window-days <n>]
 ```
+
+`--gee-project` is optional for both sites — if omitted, it falls back to `gee_project`
+in `common/credentials.json`.
 
 ### Imagery sources
 
@@ -374,10 +377,22 @@ layout from Planet Orders). Outputs:
 
 ### Tampa Bay (`seagrass/tampa_bay.py`)
 
-Reads `seagrass_transect_points.shp` and `seagrass_transect_lines.shp` from `<root_dir>`.
-Outputs a single CSV (default `tampa_bay_transects_prepared.csv`) with Landsat and
-Sentinel-2 columns appended. Pass `--planetscope-raster-dir` to also sample from
-pre-downloaded PlanetScope TIF files in that directory.
+Reads `transect_endpoints.csv` and `tb_seagrass_transects.json` from `<root_dir>`.
+Outputs two CSVs, one per sensor (matching the Indonesia style above) — e.g. with the
+default `-o tampa_transects_with_bands.csv` you get `tampa_transects_sentinel2_with_bands.csv`
+and `tampa_transects_landsat_with_bands.csv` — each with that sensor's band and index
+columns, plus Lyzenga depth-invariant and Beer-Lambert depth-corrected columns. Imagery
+is sampled from ACOLITE NetCDF output when `--acolite-dir` is given (water-optimised
+atmospheric correction), falling back to GEE's standard L2A/SR products otherwise.
+Scene matching searches ±60 days around each observation date and takes whichever
+scene is closest, rather than leaving a row blank — Tampa Bay's cloud cover regularly
+wipes out a narrower window entirely.
+
+`seagrass.py --site tampabay` only runs the final CSV-build step. To download raw
+Level-1 scenes and run ACOLITE yourself, use `seagrass/tampa_bay.py` directly — it
+has its own `dates` / `download` / `acolite` / `build` / `all` subcommands; run
+`uv run python seagrass/tampa_bay.py --help` or see the module docstring for the
+full pipeline and required accounts (Copernicus Data Space, USGS, ACOLITE).
 
 ## Satellite Architecture
 
