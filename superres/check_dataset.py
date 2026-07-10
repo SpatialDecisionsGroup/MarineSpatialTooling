@@ -185,6 +185,9 @@ class CheckReport:
             "large_shift":             "DATA QUALITY",
             "glint":                   "DATA QUALITY",
             "haze":                    "DATA QUALITY",
+            "lr_swath_edge":           "DATA QUALITY",
+            "lr_cloud":                "DATA QUALITY",
+            "hr_partial":              "DATA QUALITY",
         }
         LABEL = {
             "missing_sample_dir":      "manifest location_id has no sample directory",
@@ -202,8 +205,11 @@ class CheckReport:
             "all_nodata":              "raster appears to contain only zero / nodata values",
             "landsat_clipped":         f"Landsat band >{CLIP_FRAC_THRESHOLD:.0%} pixels saturated (reflectance ≥ 1.0)",
             "large_shift":             f"LR–HR phase-correlation shift > {ALIGNMENT_SHIFT_THRESHOLD} HR pixels ({ALIGNMENT_SHIFT_THRESHOLD * 10} m)",
-            "glint":                   f"probable sun glint (mean NIR reflectance > {GLINT_NIR_THRESHOLD:.0%})",
+            "glint":                   f"probable sun glint (NIR > {GLINT_NIR_THRESHOLD:.0%} and blue > {GLINT_MIN_BLUE:.0%})",
             "haze":                    f"probable atmospheric haze (mean blue reflectance > {HAZE_BLUE_THRESHOLD:.0%})",
+            "lr_swath_edge":           "LR image has >20% nodata (Landsat swath edge)",
+            "lr_cloud":                "LR image has >10% cloud pixels (QA_PIXEL bit 3)",
+            "hr_partial":              "HR patch has >10% nodata after standardization (S2 tile edge)",
         }
 
         current_section = None
@@ -378,8 +384,13 @@ def check_sample(sample_dir: Path, report: CheckReport, check_values: bool = Tru
 
 CLIP_FRAC_THRESHOLD       = 0.05   # flag if > 5% of reflectance pixels are ≥ 1.0
 ALIGNMENT_SHIFT_THRESHOLD = 3     # flag if phase-correlation shift > 3 HR pixels (30 m)
-GLINT_NIR_THRESHOLD       = 0.08  # flag if mean NIR reflectance > 8 % (probable sun glint)
-HAZE_BLUE_THRESHOLD       = 0.15  # flag if mean blue reflectance > 15 % (probable haze)
+GLINT_NIR_THRESHOLD       = 0.20  # NIR threshold for glint; BOTH NIR and Blue must exceed thresholds
+GLINT_MIN_BLUE            = 0.12  # glint lifts all bands; turbid water has high NIR but Blue ≤ 0.12
+HAZE_BLUE_THRESHOLD       = 0.20  # flag if mean blue reflectance > 20 % (probable haze)
+LR_NODATA_THRESHOLD       = 0.20  # flag LR image if >20% nodata (swath edge)
+LR_CLOUD_THRESHOLD        = 0.10  # flag LR image if >10% cloud (QA_PIXEL bit 3)
+HR_NODATA_THRESHOLD       = 0.10  # flag HR patch if >10% nodata (S2 tile edge)
+_LS_QA_BAND               = 8     # QA_PIXEL band index in Landsat downloads
 # Band indices in processed reflectance GeoTIFFs (1-indexed, rasterio convention)
 _LS_NIR_BAND  = 5   # Landsat SR_B5  (865 nm)
 _LS_BLUE_BAND = 2   # Landsat SR_B2  (482 nm)
@@ -474,7 +485,7 @@ def check_alignment_shift(
 
 
 def check_scene_quality(processed_sample_dir: Path, report: CheckReport, sample_name: str):
-    """Flag samples with sun glint (high NIR) or atmospheric haze (high blue).
+    """Flag samples with sun glint, haze, swath-edge nodata, cloud, or partial HR coverage.
 
     Operates on postprocessed reflectance files (scale/offset already applied).
     Reports at most one glint and one haze issue per sensor to avoid noise.
@@ -493,35 +504,83 @@ def check_scene_quality(processed_sample_dir: Path, report: CheckReport, sample_
         except Exception:
             return None
 
+    def _nodata_frac(path: Path, band_idx: int = 1) -> Optional[float]:
+        try:
+            with rasterio.open(path) as src:
+                b = src.read(band_idx)
+                nodata = src.nodata
+                nd_mask = (b == nodata) if nodata is not None else (b == 0)
+                return float(nd_mask.mean())
+        except Exception:
+            return None
+
+    def _cloud_frac(path: Path) -> Optional[float]:
+        try:
+            with rasterio.open(path) as src:
+                if src.count < _LS_QA_BAND:
+                    return None
+                b1 = src.read(1)
+                nodata = src.nodata
+                nd_mask = (b1 == nodata) if nodata is not None else (b1 == 0)
+                valid_mask = ~nd_mask
+                if valid_mask.sum() == 0:
+                    return None
+                qa = src.read(_LS_QA_BAND)
+                return float(((qa >> 3) & 1)[valid_mask].mean())
+        except Exception:
+            return None
+
     # LR (Landsat): one glint and one haze flag per sample maximum
     lr_dir = processed_sample_dir / "landsat"
     if lr_dir.exists():
-        lr_glint = lr_haze = False
+        lr_glint = lr_haze = lr_swath = lr_cloud = False
         for tif in sorted(lr_dir.glob("*.tif")):
+            if not lr_swath:
+                nd = _nodata_frac(tif, band_idx=1)
+                if nd is not None and nd > LR_NODATA_THRESHOLD:
+                    report.add("lr_swath_edge", sample_name,
+                               f"LR {tif.name}: {nd:.0%} nodata (swath edge)")
+                    lr_swath = True
+            if not lr_cloud:
+                cf = _cloud_frac(tif)
+                if cf is not None and cf > LR_CLOUD_THRESHOLD:
+                    report.add("lr_cloud", sample_name,
+                               f"LR {tif.name}: {cf:.0%} cloud pixels (QA_PIXEL)")
+                    lr_cloud = True
             if not lr_glint:
-                nir = _band_mean(tif, _LS_NIR_BAND)
-                if nir is not None and nir > GLINT_NIR_THRESHOLD:
+                nir  = _band_mean(tif, _LS_NIR_BAND)
+                blue = _band_mean(tif, _LS_BLUE_BAND)
+                # Glint lifts both NIR and Blue; turbid water has high NIR but low Blue
+                if nir is not None and blue is not None and nir > GLINT_NIR_THRESHOLD and blue > GLINT_MIN_BLUE:
                     report.add("glint", sample_name,
-                               f"LR {tif.name}: NIR mean {nir:.3f} > {GLINT_NIR_THRESHOLD}")
+                               f"LR {tif.name}: NIR {nir:.3f} > {GLINT_NIR_THRESHOLD}, blue {blue:.3f} > {GLINT_MIN_BLUE}")
                     lr_glint = True
-            if not lr_haze:
+                elif not lr_haze and blue is not None and blue > HAZE_BLUE_THRESHOLD:
+                    report.add("haze", sample_name,
+                               f"LR {tif.name}: blue mean {blue:.3f} > {HAZE_BLUE_THRESHOLD}")
+                    lr_haze = True
+            elif not lr_haze:
                 blue = _band_mean(tif, _LS_BLUE_BAND)
                 if blue is not None and blue > HAZE_BLUE_THRESHOLD:
                     report.add("haze", sample_name,
                                f"LR {tif.name}: blue mean {blue:.3f} > {HAZE_BLUE_THRESHOLD}")
                     lr_haze = True
-            if lr_glint and lr_haze:
+            if lr_glint and lr_haze and lr_swath and lr_cloud:
                 break
 
-    # HR (Sentinel-2): check the first standardised file only
+    # HR (Sentinel-2): check first standardised file for glint/haze/partial coverage
     hr_dir = processed_sample_dir / "sentinel2"
     if hr_dir.exists():
         for tif in sorted(hr_dir.glob("*.tif")):
-            nir = _band_mean(tif, _S2_NIR_BAND)
-            if nir is not None and nir > GLINT_NIR_THRESHOLD:
-                report.add("glint", sample_name,
-                           f"HR {tif.name}: NIR mean {nir:.3f} > {GLINT_NIR_THRESHOLD}")
+            nd = _nodata_frac(tif, band_idx=2)
+            if nd is not None and nd > HR_NODATA_THRESHOLD:
+                report.add("hr_partial", sample_name,
+                           f"HR {tif.name}: {nd:.0%} nodata (S2 tile edge)")
+            nir  = _band_mean(tif, _S2_NIR_BAND)
             blue = _band_mean(tif, _S2_BLUE_BAND)
+            if nir is not None and blue is not None and nir > GLINT_NIR_THRESHOLD and blue > GLINT_MIN_BLUE:
+                report.add("glint", sample_name,
+                           f"HR {tif.name}: NIR {nir:.3f} > {GLINT_NIR_THRESHOLD}, blue {blue:.3f} > {GLINT_MIN_BLUE}")
             if blue is not None and blue > HAZE_BLUE_THRESHOLD:
                 report.add("haze", sample_name,
                            f"HR {tif.name}: blue mean {blue:.3f} > {HAZE_BLUE_THRESHOLD}")
@@ -570,8 +629,8 @@ def check_dataset():
     )
     parser.add_argument(
         "--check-quality", action="store_true",
-        help=f"Flag probable sun glint (mean NIR > {GLINT_NIR_THRESHOLD}) or "
-             f"atmospheric haze (mean blue > {HAZE_BLUE_THRESHOLD}). "
+        help=f"Flag probable sun glint (NIR > {GLINT_NIR_THRESHOLD} AND blue > {GLINT_MIN_BLUE}) or "
+             f"atmospheric haze (blue > {HAZE_BLUE_THRESHOLD}). "
              f"Requires --processed-dir.",
     )
     args = parser.parse_args()

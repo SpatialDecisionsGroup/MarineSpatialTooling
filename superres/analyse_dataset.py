@@ -1114,8 +1114,6 @@ _HR_RGB = (4, 3, 2)   # Sentinel-2: B4 / B3 / B2
 # Physical scale/offset to convert stored DN → surface reflectance
 _LR_SCALE, _LR_OFFSET = 0.0000275, -0.2   # Landsat C2 L2
 _HR_SCALE, _HR_OFFSET = 1e-4, 0.0         # Sentinel-2 L2A
-_DISPLAY_MAX = 0.2   # clip reflectance at 20% before normalising
-_DISPLAY_GAMMA = 2.0  # sqrt stretch — boosts dark water without distorting colour ratios
 
 
 def _load_rgb(
@@ -1125,14 +1123,12 @@ def _load_rgb(
     b: int,
     scale: float = 1.0,
     offset: float = 0.0,
-    display_max: float = 1.0,
-    gamma: float = 1.0,
 ) -> "np.ndarray | None":
     """Read three bands, convert to reflectance, return (H,W,3) uint8 or None.
 
-    Applies a fixed physical scale/offset (preserving true colour across sensors and scenes),
-    clips at display_max, then applies a gamma stretch to lift dark water pixels into a
-    visible range without distorting the relative brightness of RGB channels.
+    Uses a 2–98 percentile stretch so clear ocean (reflectance ~0.005) and turbid
+    estuary (reflectance ~0.15) both display correctly without a fixed clip level.
+    All three bands are stretched together to preserve colour balance.
     """
     import rasterio as _rio
     files = sorted(sat_dir.glob("*.tif"))
@@ -1142,25 +1138,34 @@ def _load_rgb(
         with _rio.open(files[0]) as src:
             if src.count < max(r, g, b):
                 return None
-            bands = np.stack([src.read(i).astype(np.float32) for i in (r, g, b)], axis=-1)
+            raw = np.stack([src.read(i).astype(np.float32) for i in (r, g, b)], axis=-1)
+            nodata = src.nodata
     except Exception:
         return None
-    bands = bands * scale + offset
-    bands = np.clip(bands, 0, display_max) / display_max
-    if gamma != 1.0:
-        bands = np.power(bands, 1.0 / gamma)
-    return (bands * 255).astype(np.uint8)
+
+    nodata_mask = (raw == nodata) if nodata is not None else np.zeros(raw.shape, dtype=bool)
+    refl = raw * scale + offset
+
+    # 2-98 percentile across all valid pixels in all three bands (preserves colour balance)
+    valid = refl[~nodata_mask]
+    if valid.size < 10:
+        return None
+    lo, hi = np.percentile(valid, 2), np.percentile(valid, 98)
+    if hi <= lo:
+        hi = lo + 1e-6
+
+    stretched = np.clip((refl - lo) / (hi - lo), 0.0, 1.0)
+    stretched[nodata_mask] = 0.0
+    return (stretched * 255).astype(np.uint8)
 
 
 def _render_sample_row(axes, processed_dir: Path, loc_id: int, tag: str, meta: dict):
     """Fill a 2-element axes row with LR and HR RGB for one sample."""
     sample = f"sample_{loc_id:06d}"
     lr_rgb = _load_rgb(processed_dir / sample / "landsat",   *_LR_RGB,
-                       scale=_LR_SCALE, offset=_LR_OFFSET,
-                       display_max=_DISPLAY_MAX, gamma=_DISPLAY_GAMMA)
+                       scale=_LR_SCALE, offset=_LR_OFFSET)
     hr_rgb = _load_rgb(processed_dir / sample / "sentinel2", *_HR_RGB,
-                       scale=_HR_SCALE, offset=_HR_OFFSET,
-                       display_max=_DISPLAY_MAX, gamma=_DISPLAY_GAMMA)
+                       scale=_HR_SCALE, offset=_HR_OFFSET)
     env   = meta.get("environment_class", "?")
     depth = meta.get("depth_class", "?")
     turb  = meta.get("turbidity_class", "?")
