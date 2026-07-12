@@ -36,6 +36,15 @@ You can run 'build' with --gee-project only and skip steps 2-3 entirely; you wil
 get GEE's standard L2A atmospheric correction rather than ACOLITE's water-optimised
 correction.  ACOLITE is an upgrade, not a requirement.
 
+Speed and interruption ('build' / 'all')
+-----------------------------------------
+GEE sampling runs --workers rows concurrently (default 8; try higher — GEE's
+high-volume endpoint is used, meant for exactly this) since the work is network-
+bound, not CPU-bound. Progress checkpoints to <output-stem>.checkpoint.csv every
+CHECKPOINT_EVERY rows; if the run is killed or crashes, rerunning the exact same
+command resumes from there instead of starting over. The checkpoint is deleted
+once the run finishes successfully.
+
 ACOLITE needs raw Level-1 packages (.SAFE / .tar), which must be downloaded from
 Copernicus Data Space (https://dataspace.copernicus.eu — free account) or USGS
 (https://ers.cr.usgs.gov — free account, then generate an Application Token).
@@ -467,7 +476,15 @@ def build_transect_csv(
     checkpoint_path = output_file.with_name(f"{output_file.stem}.checkpoint.csv")
     if checkpoint_path.exists():
         try:
-            checkpoint = pd.read_csv(checkpoint_path)
+            # Force the string columns' dtype: if every non-empty value in
+            # {s2,ls}_scene_date happens to look numeric (they're YYYYMMDD
+            # strings), plain pd.read_csv silently reloads the column as
+            # float64, and the next attempt to write a date string into it
+            # raises TypeError.
+            str_cols = ["s2_scene_date", "s2_source", "ls_scene_date", "ls_source"]
+            checkpoint = pd.read_csv(checkpoint_path, dtype={c: str for c in str_cols})
+            for c in str_cols:
+                checkpoint[c] = checkpoint[c].fillna("")
             same_data = (
                 len(checkpoint) == len(frame)
                 and "record_id" in checkpoint.columns
