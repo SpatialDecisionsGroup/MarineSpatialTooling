@@ -230,11 +230,11 @@ def download_lowres_images(sample_metadata, sample_dir, logger, lowres_manager, 
 
         lowres_dir = ensure_directory(sample_dir / lowres_key)
 
-        # Match the high-res target's ground footprint (not the satellite's generic
-        # SPEC default buffer) so low-res/high-res pairs are aligned, and so Sentinel-2's
-        # many bands don't blow past Earth Engine's 48MB synchronous download cap.
+        # LR uses exactly the target patch extent (half-side as radius) with no extra
+        # margin — the 1.5× margin is only for HR to give reprojection room.  Using the
+        # margin here makes LR cover 1.5× more area than HR, which breaks paired training.
         patch_size_meters = float(sample_metadata.get("patch_size_meters", DEFAULT_PATCH_SIZE_METERS))
-        buffer_meters = _download_buffer_meters(patch_size_meters)
+        buffer_meters = patch_size_meters / 2.0
 
         lat = sample_metadata["latitude"]
         lon = sample_metadata["longitude"]

@@ -52,11 +52,24 @@ _SELECT_BORDER = 6               # border width in pixels
 
 # ─── image helpers ────────────────────────────────────────────────────────────
 
+def _center_crop(
+    arr: "np.ndarray",
+    target_h: int,
+    target_w: int,
+) -> "np.ndarray":
+    """Crop the center of (H, W, C) array to (target_h, target_w, C)."""
+    h, w = arr.shape[:2]
+    y0 = max(0, (h - target_h) // 2)
+    x0 = max(0, (w - target_w) // 2)
+    return arr[y0 : y0 + target_h, x0 : x0 + target_w]
+
+
 def _load_rgb(
     path: Path,
     bands: tuple[int, int, int],
     scale: float,
     offset: float,
+    target_meters: float | None = None,
 ) -> "np.ndarray | None":
     """Return (H, W, 3) uint8 with a 2–98 percentile stretch, or None on failure."""
     try:
@@ -67,8 +80,14 @@ def _load_rgb(
                 return None
             raw = np.stack([src.read(i).astype(np.float32) for i in (r, g, b)], axis=-1)
             nodata = src.nodata
+            pix_res = src.res
         nd_mask = (raw == nodata) if nodata is not None else (raw == 0)
-        refl = raw * scale + offset
+        if target_meters is not None and pix_res[0] > 0 and pix_res[1] > 0:
+            th = round(target_meters / pix_res[0])
+            tw = round(target_meters / pix_res[1])
+            raw     = _center_crop(raw,     min(th, raw.shape[0]),     min(tw, raw.shape[1]))
+            nd_mask = _center_crop(nd_mask, min(th, nd_mask.shape[0]), min(tw, nd_mask.shape[1]))
+        refl = np.clip(raw * scale + offset, 0.0, None)  # negatives are AC artefacts
         valid = refl[~nd_mask]
         if valid.size < 10:
             return None
@@ -87,6 +106,7 @@ def _load_lr_batch(
     bands: tuple[int, int, int],
     scale: float,
     offset: float,
+    target_meters: float | None = None,
 ) -> list["np.ndarray | None"]:
     """Load all LR images with a shared 2–98 percentile so brightness is comparable."""
     try:
@@ -102,13 +122,19 @@ def _load_lr_batch(
                         [src.read(i).astype(np.float32) for i in (r, g, b)], axis=-1
                     )
                     nodata = src.nodata
+                    pix_res = src.res
                 nd = (raw == nodata) if nodata is not None else (raw == 0)
+                if target_meters is not None and pix_res[0] > 0 and pix_res[1] > 0:
+                    th = round(target_meters / pix_res[0])
+                    tw = round(target_meters / pix_res[1])
+                    raw = _center_crop(raw, min(th, raw.shape[0]), min(tw, raw.shape[1]))
+                    nd  = _center_crop(nd,  min(th, nd.shape[0]),  min(tw, nd.shape[1]))
                 raws.append(raw); nd_masks.append(nd)
             except Exception:
                 raws.append(None); nd_masks.append(None)
 
         valid_all = [
-            (raw * scale + offset)[~nd]
+            np.clip(raw * scale + offset, 0.0, None)[~nd]
             for raw, nd in zip(raws, nd_masks)
             if raw is not None
         ]
@@ -124,7 +150,7 @@ def _load_lr_batch(
             if raw is None:
                 results.append(None)
                 continue
-            refl = raw * scale + offset
+            refl = np.clip(raw * scale + offset, 0.0, None)
             stretched = np.clip((refl - lo) / (hi - lo), 0.0, 1.0)
             stretched[nd] = 0.0
             results.append((stretched * 255).astype(np.uint8))
@@ -149,8 +175,8 @@ def _add_border(
 
 # ─── data helpers ─────────────────────────────────────────────────────────────
 
-@st.cache_data
 def _all_sample_ids(data_dir: str) -> list[int]:
+    # No cache — directory glob is fast and we want a browser refresh to pick up new samples.
     return sorted(
         int(d.name.split("_")[1])
         for d in Path(data_dir).glob("sample_*")
@@ -228,7 +254,7 @@ def _render_lr_grid(
             with col:
                 if rgb is not None:
                     display = _add_border(rgb) if is_sel else rgb
-                    st.image(display, use_container_width=True)
+                    st.image(display, width='stretch')
                 else:
                     bg = "#3a2000" if is_sel else "#1a1a1a"
                     st.markdown(
@@ -250,7 +276,7 @@ def _render_lr_grid(
                     f"{'✓ ' if is_sel else ''}{date}",
                     key=f"sel_{loc_id}_{fname}",
                     on_click=_toggle,
-                    use_container_width=True,
+                    width='stretch',
                     type="primary" if is_sel else "secondary",
                     help="Click to select/deselect this image for replacement",
                 )
@@ -337,10 +363,10 @@ def main() -> None:
                 st.caption(f"#{jump} not in current filter.")
 
         cp, cn = st.columns(2)
-        if cp.button("◀ Prev", use_container_width=True, disabled=(idx == 0)):
+        if cp.button("◀ Prev", width='stretch', disabled=(idx == 0)):
             st.session_state.idx = idx - 1
             st.rerun()
-        if cn.button("Next ▶", use_container_width=True, disabled=(idx == len(visible) - 1)):
+        if cn.button("Next ▶", width='stretch', disabled=(idx == len(visible) - 1)):
             st.session_state.idx = idx + 1
             st.rerun()
         st.caption(f"{idx + 1} / {len(visible)} visible")
@@ -389,21 +415,20 @@ def main() -> None:
     meta        = _meta(data_dir, loc_id)
     current_dec = decisions.get(str(loc_id))
     cur_action  = _get_action(current_dec)
-    env         = meta.get("environment_class",  "?")
-    depth_cls   = meta.get("depth_class",         "?")
-    turb_cls    = meta.get("turbidity_class",     "?")
-    lat         = meta.get("latitude",            "?")
-    lon         = meta.get("longitude",           "?")
+    habitat     = meta.get("habitat_class", "?")
+    lat         = meta.get("latitude",      "?")
+    lon         = meta.get("longitude",     "?")
     depth_m     = meta.get("depth_m")
-    n_lr        = meta.get("lowres_count",        "?")
+    n_lr        = meta.get("lowres_count",  "?")
     dr_start    = (meta.get("date_range_start") or "")[:10]
     dr_end      = (meta.get("date_range_end")   or "")[:10]
+    patch_size_m = float(meta.get("patch_size_meters", 5120.0))
 
     hcol, bcol = st.columns([5, 1])
     with hcol:
         st.title(f"Sample #{loc_id}")
         st.caption(
-            f"{env} / {depth_cls} / {turb_cls}  ·  ({lat}, {lon})"
+            f"{habitat}  ·  ({lat}, {lon})"
             + (f"  ·  {depth_m:.0f} m" if isinstance(depth_m, (int, float)) else "")
             + (f"  ·  LR window {dr_start} → {dr_end}" if dr_start else "")
         )
@@ -425,19 +450,21 @@ def main() -> None:
         )
     with sel_col:
         if n_sel:
-            if st.button("Clear selection", use_container_width=True):
+            if st.button("Clear selection", width='stretch'):
                 st.session_state.lr_selected[str(loc_id)] = set()
                 st.rerun()
         else:
-            if st.button("Select all", use_container_width=True):
+            if st.button("Select all", width='stretch'):
                 st.session_state.lr_selected[str(loc_id)] = {f.name for f in lr_files}
                 st.rerun()
 
     if lr_files:
         if stretch_mode == "shared":
-            lr_rgbs = _load_lr_batch(lr_files, _LR_RGB, _LR_SCALE, _LR_OFFSET)
+            lr_rgbs = _load_lr_batch(lr_files, _LR_RGB, _LR_SCALE, _LR_OFFSET,
+                                     target_meters=patch_size_m)
         else:
-            lr_rgbs = [_load_rgb(f, _LR_RGB, _LR_SCALE, _LR_OFFSET) for f in lr_files]
+            lr_rgbs = [_load_rgb(f, _LR_RGB, _LR_SCALE, _LR_OFFSET,
+                                 target_meters=patch_size_m) for f in lr_files]
         _render_lr_grid(lr_files, lr_rgbs, loc_id, selected)
     else:
         st.warning("No Landsat images found.")
@@ -455,7 +482,7 @@ def main() -> None:
         if s2_files:
             s2_rgb = _load_rgb(s2_files[0], _HR_RGB, _HR_SCALE, _HR_OFFSET)
             if s2_rgb is not None:
-                st.image(s2_rgb, caption=s2_files[0].name, use_container_width=True)
+                st.image(s2_rgb, caption=s2_files[0].name, width='stretch')
             else:
                 st.warning("Could not render HR image.")
         else:
@@ -463,14 +490,11 @@ def main() -> None:
 
     with meta_col:
         st.subheader("Metadata")
-        mc1, mc2, mc3 = st.columns(3)
-        mc1.metric("Environment",  env)
-        mc1.metric("# LR images", n_lr)
-        mc2.metric("Depth class",  depth_cls)
+        mc1, mc2 = st.columns(2)
+        mc1.metric("Habitat",      habitat)
+        mc1.metric("# LR images",  n_lr)
         mc2.metric("Depth",        f"{depth_m:.0f} m" if isinstance(depth_m, (int, float)) else "?")
-        mc3.metric("Turbidity",    turb_cls)
-        turb_idx = meta.get("turbidity_index")
-        mc3.metric("Turb. index",  f"{turb_idx:.4f}" if isinstance(turb_idx, float) else "?")
+        mc2.metric("Patch size",   f"{patch_size_m:.0f} m")
 
     st.divider()
 
@@ -499,7 +523,7 @@ def main() -> None:
             label,
             key=f"action_{key}",
             on_click=_action_cb(key),
-            use_container_width=True,
+            width='stretch',
             type="primary" if is_cur else "secondary",
         )
 
@@ -519,7 +543,7 @@ def main() -> None:
             f"Replace {n_sel} selected",
             key="action_replace_selected",
             on_click=_replace_selected,
-            use_container_width=True,
+            width='stretch',
             type="primary" if is_cur_partial else "secondary",
             help=f"Mark only the {n_sel} highlighted Landsat image(s) for replacement",
         )

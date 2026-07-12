@@ -9,6 +9,7 @@ from typing import Optional
 
 from .constants import (
     DEFAULT_OUTPUT_DIR,
+    HABITAT_EXTENTS_DIR,
     METADATA_SUBDIR,
     CREDENTIALS_SUBDIR,
     CREDENTIALS_CONFIG_FILENAME,
@@ -178,7 +179,8 @@ def config_create():
     )
     parser.add_argument("--coastline-dir", default="./data/gshhg-shp-2.3.7", help="Path to the GSHHG/WDBII coastline dataset")
     parser.add_argument("--gebco-file", default="./data/gebco_2026_geotiff", help="Path to the GEBCO bathymetry GeoTIFF (defaults to auto-discovery under ./data)")
-    parser.add_argument("--turbidity-file", default="./data/turbidity.nc", help="Path to turbidity raster (.nc or GeoTIFF) to use instead of API calls")
+    parser.add_argument("--turbidity-file", default="./data/turbidity.nc", help="Path to Kd490/turbidity raster (.nc or GeoTIFF) used for bottom-visibility check")
+    parser.add_argument("--habitat-extents-dir", default=HABITAT_EXTENTS_DIR, help="Directory containing coral/seagrass/mangrove habitat polygon subdirectories (from habitat_extents.sh)")
     parser.add_argument("--include-ecoregions", help="Comma-separated province names to include (prioritized). Use 'indonesia' for Indonesia regions.")
     parser.add_argument("--exclude-ecoregions", help="Comma-separated province names to exclude")
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True, help="Resume from an existing dataset_metadata.json (default: on; use --no-resume to start fresh)")
@@ -238,6 +240,7 @@ def config_create():
     config.samples_per_area = samples_per_area
     config.include_ecoregions = include_list
     config.exclude_ecoregions = exclude_list
+    config.habitat_extents_dir = args.habitat_extents_dir
     config.resume = args.resume or args.check
     config.check_existing = args.check
     config.manifest_only = args.manifest_only

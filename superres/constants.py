@@ -70,26 +70,15 @@ PATCH_SIZE_PIXELS = 512
 # and is only used as a fallback when a manifest row has no patch_size_meters.
 DEFAULT_PATCH_SIZE_METERS = PATCH_SIZE_PIXELS * SENTINEL2_RESOLUTION
 
-ENVIRONMENT_CLASSES = ["estuary", "offshore"]
-DEPTH_CLASSES = ["shallow_1", "shallow_2", "shallow_3"]
-TURBIDITY_CLASSES = ["clear", "moderate", "turbid"]
+HABITAT_CLASSES = ["coral", "seagrass", "mangrove"]
+HABITAT_EXTENTS_DIR = "./data/habitat_extents"
 
-DEPTH_BINS_METERS = [
-    (0.0, 10.0),
-    (10.0, 30.0),
-    (30.0, 60.0),
-]
+# Kd490 (diffuse attenuation at 490 nm, m⁻¹) threshold for bottom-visibility check.
+# Coral and seagrass samples are rejected when Kd490 exceeds this — the water is
+# too turbid to see benthic habitat.  Mangrove is emergent so no check is applied.
+BOTTOM_VISIBILITY_KD490_MAX = 0.3
 
-TURBIDITY_BINS = [
-    ("clear", -1.0, 0.03),
-    ("moderate", 0.03, 0.08),
-    ("turbid", 0.08, None),
-]
-
-RIVER_DISTANCE_METERS = 5000.0
-ESTUARY_DISTANCE_METERS = 30000.0
-OFFSHORE_DISTANCE_METERS = 50000.0
-TURBIDITY_BUFFER_METERS = 1500.0
+TURBIDITY_BUFFER_METERS = 1500.0  # radius used by the Landsat turbidity estimator
 
 # Tiling configuration
 TILE_SIZE_PIXELS = PATCH_SIZE_PIXELS  # 512×512 pixel tiles for training
@@ -116,11 +105,8 @@ MANIFEST_COLUMNS = [
     "longitude",
     "season_id",
     "province",
-    "environment_class",
-    "depth_class",
+    "habitat_class",
     "depth_m",
-    "turbidity_class",
-    "turbidity_index",
     "date_range_start",
     "date_range_end",
     "alignment_crs",

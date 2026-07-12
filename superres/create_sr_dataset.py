@@ -21,14 +21,11 @@ from common.dataset_utils import setup_logger
 
 from .config import config_create
 from .constants import (
-    DEPTH_CLASSES,
-    ENVIRONMENT_CLASSES,
+    HABITAT_CLASSES,
     LOWRES_MAX_IMAGES,
     LOWRES_MIN_IMAGES,
     PATCH_SIZE_PIXELS,
     PLANETSCOPE_PRODUCT_BUNDLE,
-    TURBIDITY_BUFFER_METERS,
-    TURBIDITY_CLASSES,
 )
 from common.gee_satellite import GEESatelliteManager
 from .download_and_preprocess import download_highres_gee_image, download_lowres_images
@@ -58,23 +55,18 @@ def _split_total_across_targets(total_samples: int, targets: List[SampleTarget])
     return counts
 
 
-def _existing_target_counts(metadata: DatasetMetadata) -> Dict[Tuple[str, str, str], int]:
-    counts: Dict[Tuple[str, str, str], int] = {}
+def _existing_target_counts(metadata: DatasetMetadata) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
     for sample in metadata.metadata.get("samples", []):
-        key = (
-            str(sample.get("environment_class", "")),
-            str(sample.get("depth_class", "")),
-            str(sample.get("turbidity_class", "")),
-        )
+        key = str(sample.get("habitat_class", ""))
         counts[key] = counts.get(key, 0) + 1
     return counts
 
 
-def _remaining_target_counts(target_counts: Dict[SampleTarget, int], existing_counts: Dict[Tuple[str, str, str], int], targets: List[SampleTarget]) -> Dict[SampleTarget, int]:
+def _remaining_target_counts(target_counts: Dict[SampleTarget, int], existing_counts: Dict[str, int], targets: List[SampleTarget]) -> Dict[SampleTarget, int]:
     remaining: Dict[SampleTarget, int] = {}
     for target in targets:
-        current_key = (target.environment_class, target.depth_class, target.turbidity_class)
-        completed = existing_counts.get(current_key, 0)
+        completed = existing_counts.get(target.habitat_class, 0)
         remaining[target] = max(0, target_counts[target] - completed)
     return remaining
 
@@ -84,19 +76,13 @@ def _open_targets(remaining_counts: Dict[SampleTarget, int]) -> List[SampleTarge
 
 
 def _find_matching_target(
-    environment_class: str,
-    depth_class: str,
-    turbidity_class: str,
+    habitat_class: str,
     remaining_counts: Dict[SampleTarget, int],
 ) -> Optional[SampleTarget]:
     for target, count in remaining_counts.items():
         if count <= 0:
             continue
-        if (
-            target.environment_class == environment_class
-            and target.depth_class == depth_class
-            and target.turbidity_class == turbidity_class
-        ):
+        if target.habitat_class == habitat_class:
             return target
     return None
 
@@ -165,12 +151,10 @@ def _repair_broken_samples(metadata: DatasetMetadata, data_dir: Path, logger) ->
         location_id = int(sample["location_id"])
         sample_dir = data_dir / f"sample_{location_id:06d}"
         logger.info(
-            "Check: sample %s (%s/%s/%s) has a partial download with no sample_metadata.json "
+            "Check: sample %s (%s) has a partial download with no sample_metadata.json "
             "checkpoint - deleting %s and regenerating a replacement",
             location_id,
-            sample.get("environment_class"),
-            sample.get("depth_class"),
-            sample.get("turbidity_class"),
+            sample.get("habitat_class"),
             sample_dir,
         )
         shutil.rmtree(sample_dir, ignore_errors=True)
@@ -179,6 +163,52 @@ def _repair_broken_samples(metadata: DatasetMetadata, data_dir: Path, logger) ->
     freed_ids = sorted(int(sample["location_id"]) for sample in broken)
     logger.info("Check: removed %s incomplete sample(s); will regenerate ids %s", len(freed_ids), freed_ids)
     print(f"Check: found {len(freed_ids)} incomplete sample(s) on disk; regenerating: {freed_ids}")
+    return freed_ids
+
+
+def _reclassify_existing_samples(
+    metadata: DatasetMetadata,
+    data_dir: Path,
+    sampler: "WorldPatchSampler",
+    logger,
+) -> List[int]:
+    """Delete legacy samples that predate habitat-based stratification.
+
+    Any sample missing a ``habitat_class`` field was collected under the old
+    environment/depth/turbidity scheme and is incompatible with the current
+    dataset schema.  They are removed from disk and from metadata so their
+    location_ids can be reused for new habitat samples.
+
+    Returns the list of freed location_ids.
+    """
+    samples = metadata.metadata.get("samples", [])
+    if not samples:
+        return []
+
+    good, deleted = [], []
+    valid_habitats = set(HABITAT_CLASSES)
+
+    for sample in samples:
+        habitat = sample.get("habitat_class")
+        if habitat in valid_habitats:
+            good.append(sample)
+        else:
+            loc_id = int(sample["location_id"])
+            shutil.rmtree(data_dir / f"sample_{loc_id:06d}", ignore_errors=True)
+            deleted.append(sample)
+            logger.info(
+                "Reclassify: deleted legacy sample %s (habitat_class=%r) — not in current strata",
+                loc_id, habitat,
+            )
+
+    metadata.metadata["samples"] = good
+    freed_ids = sorted(int(s["location_id"]) for s in deleted)
+
+    print(f"Reclassify: {len(deleted)} legacy samples deleted, {len(good)} kept.")
+    if freed_ids:
+        logger.info("Reclassify: freed location_ids for reuse: %s", freed_ids)
+        metadata.save_checkpoint()
+
     return freed_ids
 
 
@@ -206,6 +236,7 @@ def create_dataset():
         config.gebco_file,
         logger,
         turbidity_raster=getattr(config, "turbidity_file", None),
+        habitat_extents_dir=getattr(config, "habitat_extents_dir", None),
         patch_size_meters=patch_size_meters,
     )
 
@@ -225,6 +256,15 @@ def create_dataset():
     print(f"High-res satellite: {config.highres_satellite} ({highres_manager.resolution_meters():.0f} m)")
     print(f"Patch size: {PATCH_SIZE_PIXELS} x {PATCH_SIZE_PIXELS} pixels")
     print(f"Ground size: {patch_size_meters:.0f} m x {patch_size_meters:.0f} m")
+
+    # Re-classify existing samples against the current environment constants whenever
+    # resuming, so that label changes (e.g. 'offshore' → 'coastal' or deleted) take
+    # effect automatically without a separate migration script.
+    if getattr(config, "resume", False):
+        freed_from_reclassify = _reclassify_existing_samples(
+            metadata, config.data_dir, sampler, logger
+        )
+        freed_location_ids.extend(freed_from_reclassify)
 
     bank_start = perf_counter()
     sampler.build_candidate_bank(per_environment_depth=24)
@@ -290,10 +330,8 @@ def create_dataset():
 
             target = open_targets[int(rng.integers(0, len(open_targets)))]
             logger.info(
-                "Targeting %s/%s/%s: need %s samples",
-                target.environment_class,
-                target.depth_class,
-                target.turbidity_class,
+                "Targeting %s: need %s samples",
+                target.habitat_class,
                 remaining_counts[target],
             )
 
@@ -303,19 +341,15 @@ def create_dataset():
             candidate_seconds = perf_counter() - attempt_start
             if candidate is None:
                 logger.debug(
-                    "Sampler returned no candidate for target %s/%s/%s after %.2fs",
-                    target.environment_class,
-                    target.depth_class,
-                    target.turbidity_class,
+                    "Sampler returned no candidate for habitat %s after %.2fs",
+                    target.habitat_class,
                     candidate_seconds,
                 )
                 continue
 
             logger.debug(
-                "Candidate search for target %s/%s/%s took %.2fs at (%.6f, %.6f)",
-                target.environment_class,
-                target.depth_class,
-                target.turbidity_class,
+                "Candidate search for habitat %s took %.2fs at (%.6f, %.6f)",
+                target.habitat_class,
                 candidate_seconds,
                 candidate["latitude"],
                 candidate["longitude"],
@@ -336,12 +370,10 @@ def create_dataset():
             highres_seconds = perf_counter() - highres_start
             if not highres_candidates:
                 logger.debug(
-                    "No high-res catalog candidates at (%.6f, %.6f) for target %s/%s/%s after %.2fs",
+                    "No high-res catalog candidates at (%.6f, %.6f) for habitat %s after %.2fs",
                     candidate["latitude"],
                     candidate["longitude"],
-                    target.environment_class,
-                    target.depth_class,
-                    target.turbidity_class,
+                    target.habitat_class,
                     highres_seconds,
                 )
                 continue
@@ -382,38 +414,16 @@ def create_dataset():
                     )
                     break
 
-                turbidity_start = perf_counter()
-                turbidity_info = lowres_manager.estimate_turbidity_class(
-                    candidate["latitude"],
-                    candidate["longitude"],
-                    lowres_window_start,
-                    lowres_window_end,
-                    buffer_meters=TURBIDITY_BUFFER_METERS,
-                )
-                turbidity_seconds = perf_counter() - turbidity_start
-                if not turbidity_info:
-                    logger.debug(
-                        "Turbidity estimation failed for location (%.6f, %.6f) after %.2fs",
-                        candidate["latitude"],
-                        candidate["longitude"],
-                        turbidity_seconds,
-                    )
-                    continue
-
                 matched_target = _find_matching_target(
-                    candidate["environment_class"],
-                    candidate["depth_class"],
-                    turbidity_info["turbidity_class"],
+                    candidate["habitat_class"],
                     remaining_counts,
                 )
                 if matched_target is None:
                     logger.debug(
-                        "Candidate at (%.6f, %.6f) fits no open stratum: env=%s depth=%s turbidity=%s",
+                        "Candidate at (%.6f, %.6f) fits no open stratum: habitat=%s",
                         candidate["latitude"],
                         candidate["longitude"],
-                        candidate["environment_class"],
-                        candidate["depth_class"],
-                        turbidity_info.get("turbidity_class"),
+                        candidate["habitat_class"],
                     )
                     break
 
@@ -426,11 +436,8 @@ def create_dataset():
                     "longitude": candidate["longitude"],
                     "season_id": _season_id_from_month(highres_day.month),
                     "province": "global",
-                    "environment_class": matched_target.environment_class,
-                    "depth_class": matched_target.depth_class,
+                    "habitat_class": matched_target.habitat_class,
                     "depth_m": candidate["depth_m"],
-                    "turbidity_class": matched_target.turbidity_class,
-                    "turbidity_index": turbidity_info["turbidity_index"],
                     "date_range": (lowres_window_start, lowres_window_end),
                     "date_range_start": lowres_window_start,
                     "date_range_end": lowres_window_end,
@@ -488,18 +495,15 @@ def create_dataset():
                 metadata.update_dataset_sample_count(current_total)
                 metadata.save_checkpoint()
                 logger.info(
-                    "Accepted candidate at (%.6f, %.6f) into %s/%s/%s; remaining=%s; "
-                    "timings candidate=%.2fs highres=%.2fs lowres=%.2fs turbidity=%.2fs download=%.2fs total_run=%.2fs",
+                    "Accepted candidate at (%.6f, %.6f) into habitat=%s; remaining=%s; "
+                    "timings candidate=%.2fs highres=%.2fs lowres=%.2fs download=%.2fs total_run=%.2fs",
                     candidate["latitude"],
                     candidate["longitude"],
-                    matched_target.environment_class,
-                    matched_target.depth_class,
-                    matched_target.turbidity_class,
+                    matched_target.habitat_class,
                     remaining_counts[matched_target],
                     candidate_seconds,
                     highres_seconds,
                     lowres_seconds,
-                    turbidity_seconds,
                     download_seconds,
                     perf_counter() - run_start,
                 )
@@ -522,9 +526,7 @@ def create_dataset():
     print("Dataset creation complete!")
     print(f"Output directory: {config.output_dir}")
     print(f"Paired location samples: {current_total}")
-    print(f"  Environment classes: {', '.join(ENVIRONMENT_CLASSES)}")
-    print(f"  Depth classes: {', '.join(DEPTH_CLASSES)}")
-    print(f"  Turbidity classes: {', '.join(TURBIDITY_CLASSES)}")
+    print(f"  Habitat classes: {', '.join(HABITAT_CLASSES)}")
     print(f"  Patch size: {PATCH_SIZE_PIXELS}x{PATCH_SIZE_PIXELS} pixels")
     print(f"  Low-res satellite: {config.lowres_satellite}")
     print(f"  High-res satellite: {config.highres_satellite}")

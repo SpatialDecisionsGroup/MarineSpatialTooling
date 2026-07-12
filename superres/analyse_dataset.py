@@ -115,10 +115,7 @@ COMPARABLE_PAIRS = [
 LR_SPATIAL_BAND_IDX = 3   # SR_B4 (red, band index 1-based in rasterio)
 HR_SPATIAL_BAND_IDX = 4   # B4   (red)
 
-ENV_PALETTE  = {"estuary": "#2196F3", "offshore": "#FF7043"}
-DEPTH_PALETTE = {"shallow_1": "#B3E5FC", "shallow_2": "#039BE5", "shallow_3": "#01579B"}
-TURB_PALETTE  = {"clear": "#A5D6A7", "moderate": "#FFA726", "turbid": "#E53935"}
-DEPTH_BIN_LABELS = {"shallow_1": "0–10 m", "shallow_2": "10–30 m", "shallow_3": "30–60 m"}
+HABITAT_PALETTE = {"coral": "#EF5350", "seagrass": "#66BB6A", "mangrove": "#8D6E63"}
 
 LR_COLOR = "#1565C0"   # dark blue for Landsat
 HR_COLOR = "#AD1457"   # dark pink for Sentinel-2
@@ -231,11 +228,8 @@ def _sample_reflectance(
                         "band": bname,
                         "reflectance": float(np.mean(valid)),
                         "clip_frac": clip_frac,
-                        "environment_class": row["environment_class"],
-                        "depth_class": row["depth_class"],
-                        "turbidity_class": row["turbidity_class"],
-                        "depth_m": row["depth_m"],
-                        "turbidity_index": row["turbidity_index"],
+                        "habitat_class": row.get("habitat_class", ""),
+                        "depth_m": row.get("depth_m"),
                     })
         except Exception:
             continue
@@ -302,75 +296,31 @@ def _draw_spatial(ax, df, col, palette, title, world):
 
 def fig_spatial_distribution(df: pd.DataFrame, out_dir: Path):
     world = _world_boundary()
-    specs = [
-        ("environment_class", ENV_PALETTE,   "Environment class",
-         "01a_spatial_environment.png"),
-        ("depth_class",       DEPTH_PALETTE, "Depth class",
-         "01b_spatial_depth.png"),
-        ("turbidity_class",   TURB_PALETTE,  "Turbidity class",
-         "01c_spatial_turbidity.png"),
-    ]
-    for col, palette, title, fname in specs:
-        fig, ax = plt.subplots(figsize=(9, 5))
-        _draw_spatial(ax, df, col, palette, title, world)
-        _savefig(fig, out_dir / fname)
-
-    fig, axes = plt.subplots(1, 3, figsize=(22, 5))
-    for ax, (col, palette, title, _) in zip(axes, specs):
-        _draw_spatial(ax, df, col, palette, title, world)
-    axes[1].set_ylabel(""); axes[2].set_ylabel("")
+    fig, ax = plt.subplots(figsize=(12, 6))
+    _draw_spatial(ax, df, "habitat_class", HABITAT_PALETTE, "Habitat class", world)
     fig.suptitle(f"Spatial distribution of {len(df):,} dataset patches", fontsize=12)
     _savefig(fig, out_dir / "01_spatial_distribution.png")
 
 
-# ── 02 Depth–turbidity density ────────────────────────────────────────────────
+# ── 02 Depth by habitat ───────────────────────────────────────────────────────
 
-_LOG_TICKS = np.array([-2.0, -1.5, -1.0, -0.5, 0.0, 0.5])
-
-
-def _set_log_yaxis(ax):
-    ax.set_yticks(_LOG_TICKS)
-    ax.set_yticklabels([f"{10**t:.3g}" for t in _LOG_TICKS])
-    ax.set_ylabel("Turbidity index (log scale)")
-    for thresh, color in [(0.03, "#FFA726"), (0.08, "#E53935")]:
-        ax.axhline(np.log10(thresh), color=color, lw=1.0, ls="--", alpha=0.8)
-
-
-
-def _draw_depth_turb_hist(ax, valid):
-    turb_vals = valid["turbidity_index"]
-    depth_bins = np.linspace(valid["depth_m"].min(), valid["depth_m"].max(), 31)
-    log_bins   = np.linspace(np.log10(turb_vals.min()), np.log10(turb_vals.max()), 31)
-
-    for env, hex_color in ENV_PALETTE.items():
-        sub = valid[valid["environment_class"] == env]
+def fig_depth_by_habitat(df: pd.DataFrame, out_dir: Path):
+    """Depth distribution overlaid per habitat class."""
+    valid = df.dropna(subset=["depth_m"]).copy()
+    fig, ax = plt.subplots(figsize=(7, 5))
+    depth_max = valid["depth_m"].quantile(0.99)
+    bins = np.linspace(0, max(depth_max, 1), 51)
+    for habitat, color in HABITAT_PALETTE.items():
+        sub = valid[valid["habitat_class"] == habitat]["depth_m"]
         if sub.empty:
             continue
-        counts, xedges, yedges = np.histogram2d(
-            sub["depth_m"], np.log10(sub["turbidity_index"]),
-            bins=[depth_bins, log_bins],
-        )
-        cmap = mcolors.LinearSegmentedColormap.from_list(
-            f"env_{env}", ["#ffffff00", hex_color], N=256,
-        )
-        norm = mcolors.LogNorm(vmin=1, vmax=max(counts.max(), 1))
-        masked = np.ma.masked_where(counts == 0, counts)
-        ax.pcolormesh(xedges, yedges, masked.T, cmap=cmap, norm=norm, alpha=0.75)
-
-    _set_log_yaxis(ax)
+        ax.hist(sub, bins=bins, color=color, alpha=0.6, label=habitat, edgecolor="none")
     ax.set_xlabel("Depth (m)")
-    ax.set_title("Depth–turbidity density (estuary / offshore)", fontsize=10)
-    handles = [plt.Rectangle((0, 0), 1, 1, color=c, label=e) for e, c in ENV_PALETTE.items()]
-    ax.legend(handles=handles, fontsize=8)
-    ax.grid(True, linewidth=0.3, alpha=0.4)
-
-
-def fig_depth_turbidity_density(df: pd.DataFrame, out_dir: Path):
-    valid = df[df["turbidity_index"] > 0].copy()
-
-    fig, ax = plt.subplots(figsize=(7, 5))
-    _draw_depth_turb_hist(ax, valid)
-    _savefig(fig, out_dir / "02_depth_turbidity_density.png")
+    ax.set_ylabel("Count")
+    ax.set_title("Depth distribution by habitat class", fontsize=10)
+    ax.legend(fontsize=9)
+    ax.grid(True, linewidth=0.3, alpha=0.4, axis="y")
+    _savefig(fig, out_dir / "02_depth_by_habitat.png")
 
 
 def fig_band_reflectance(ls_df: pd.DataFrame, s2_df: pd.DataFrame, out_dir: Path):
@@ -544,26 +494,27 @@ def _draw_spec_scatter(ax, pairs_df):
 
 
 def _draw_spec_bias_band(ax, pairs_df):
+    hue_order = [h for h in HABITAT_PALETTE if h in pairs_df["habitat_class"].unique()]
     sns.boxplot(data=pairs_df, x="band_label", y="diff",
-                hue="turbidity_class", hue_order=["clear", "moderate", "turbid"],
-                palette=TURB_PALETTE,
+                hue="habitat_class", hue_order=hue_order,
+                palette=HABITAT_PALETTE,
                 flierprops=dict(marker=".", markersize=2, alpha=0.3),
                 ax=ax, linewidth=0.7)
     ax.axhline(0, color="k", lw=0.8, ls="--")
     ax.set_xlabel("Band pair"); ax.set_ylabel("S2 − Landsat reflectance")
-    ax.set_title("Cross-spectral bias by band (coloured by turbidity class)", fontsize=10)
+    ax.set_title("Cross-spectral bias by band (coloured by habitat class)", fontsize=10)
     ax.tick_params(axis="x", rotation=30)
-    ax.legend(title="turbidity", fontsize=8)
+    ax.legend(title="habitat", fontsize=8)
     ax.grid(True, linewidth=0.3, alpha=0.4, axis="y")
 
 
 def _draw_spec_bias_gap(ax, pairs_df):
     gap_df = pairs_df.dropna(subset=["gap_days"])
     if not gap_df.empty:
-        for turb, color in TURB_PALETTE.items():
-            sub = gap_df[gap_df["turbidity_class"] == turb]
+        for habitat, color in HABITAT_PALETTE.items():
+            sub = gap_df[gap_df["habitat_class"] == habitat]
             ax.scatter(sub["gap_days"], sub["diff"], c=color, s=6, alpha=0.3,
-                       linewidths=0, label=turb)
+                       linewidths=0, label=habitat)
         trend = gap_df.sort_values("gap_days")
         win = max(30, len(trend) // 20)
         rolled = trend["diff"].rolling(win, min_periods=5, center=True).mean()
@@ -572,7 +523,7 @@ def _draw_spec_bias_gap(ax, pairs_df):
         ax.set_xlabel("Min |LR – HR| acquisition gap (days)")
         ax.set_ylabel("S2 − Landsat reflectance")
         ax.set_title("Cross-spectral bias vs acquisition time gap\n"
-                     "(all matched bands; coloured by turbidity)", fontsize=10)
+                     "(all matched bands; coloured by habitat)", fontsize=10)
         ax.legend(fontsize=8, markerscale=2)
         ax.grid(True, linewidth=0.3, alpha=0.4)
     else:
@@ -592,23 +543,23 @@ def fig_spectral_difficulty(
         return
 
     ls_pivot = ls_df.pivot_table(
-        index=["location_id", "turbidity_class", "environment_class", "depth_class"],
+        index=["location_id", "habitat_class"],
         columns="band", values="reflectance",
     ).reset_index()
     s2_pivot = s2_df.pivot_table(
-        index=["location_id", "turbidity_class", "environment_class", "depth_class"],
+        index=["location_id", "habitat_class"],
         columns="band", values="reflectance",
     ).reset_index()
 
     combined = pd.merge(ls_pivot, s2_pivot, on="location_id", suffixes=("_ls", "_s2"))
-    turb_col = "turbidity_class_ls" if "turbidity_class_ls" in combined else "turbidity_class"
+    habitat_col = "habitat_class_ls" if "habitat_class_ls" in combined else "habitat_class"
 
     pair_dfs = []
     for ls_b, s2_b, label in COMPARABLE_PAIRS:
         if ls_b not in combined.columns or s2_b not in combined.columns:
             continue
-        tmp = combined[["location_id", turb_col, ls_b, s2_b]].copy().dropna()
-        tmp.columns = ["location_id", "turbidity_class", "landsat", "sentinel2"]
+        tmp = combined[["location_id", habitat_col, ls_b, s2_b]].copy().dropna()
+        tmp.columns = ["location_id", "habitat_class", "landsat", "sentinel2"]
         tmp["band_label"] = label
         tmp["diff"] = tmp["sentinel2"] - tmp["landsat"]
         pair_dfs.append(tmp)
@@ -621,6 +572,9 @@ def fig_spectral_difficulty(
     sampled_ids = list(pairs_df["location_id"].unique())
     gaps = _compute_time_gaps(df_manifest, processed_dir, sampled_ids)
     pairs_df["gap_days"] = pairs_df["location_id"].map(gaps)
+    # Ensure habitat_class column exists for plotting helpers
+    if "habitat_class" not in pairs_df.columns:
+        pairs_df["habitat_class"] = ""
 
     fig, ax = plt.subplots(figsize=(6, 6))
     _draw_spec_scatter(ax, pairs_df)
@@ -661,54 +615,56 @@ def _draw_depth_all(ax, df):
     ax.grid(True, linewidth=0.3, alpha=0.4, axis="y")
 
 
-def _draw_turbidity_log_all(ax, df):
-    valid_turb = df["turbidity_index"].replace(0, np.nan).dropna()
-    ax.hist(np.log10(valid_turb), bins=50, color="#26A69A", alpha=0.85, edgecolor="none")
-    ax.set_xlabel("log₁₀(turbidity index)"); ax.set_ylabel("Count")
-    ax.set_title("Turbidity index (log scale) – all samples", fontsize=10)
-    for thresh, color, label in [(np.log10(0.03), "#FFA726", "clear|moderate"),
-                                  (np.log10(0.08), "#E53935", "moderate|turbid")]:
-        ax.axvline(thresh, color=color, lw=1.2, ls="--", label=label)
-    ax.legend(fontsize=7)
-    ax.grid(True, linewidth=0.3, alpha=0.4, axis="y")
-
 
 def fig_class_histograms(df: pd.DataFrame, out_dir: Path):
-    hist_specs = [
-        ({e: (df[df["environment_class"] == e]["depth_m"], c)
-          for e, c in ENV_PALETTE.items()},
-         "Depth (m)", "Depth by environment class", "05a_hist_depth_by_env.png"),
-        ({e: (df[df["environment_class"] == e]["turbidity_index"], c)
-          for e, c in ENV_PALETTE.items()},
-         "Turbidity index", "Turbidity by environment class", "05b_hist_turbidity_by_env.png"),
-        ({t: (df[df["turbidity_class"] == t]["depth_m"], c)
-          for t, c in TURB_PALETTE.items()},
-         "Depth (m)", "Depth by turbidity class", "05c_hist_depth_by_turbidity.png"),
-        ({DEPTH_BIN_LABELS[d]: (df[df["depth_class"] == d]["turbidity_index"], c)
-          for d, c in DEPTH_PALETTE.items()},
-         "Turbidity index", "Turbidity by depth class", "05d_hist_turbidity_by_depth.png"),
-    ]
-    for series_by_label, xlabel, title, fname in hist_specs:
-        fig, ax = plt.subplots(figsize=(6, 4))
-        _draw_class_hist(ax, series_by_label, xlabel, title)
-        _savefig(fig, out_dir / fname)
-
+    # 05a: Depth by habitat class
     fig, ax = plt.subplots(figsize=(6, 4))
     _draw_depth_all(ax, df)
-    _savefig(fig, out_dir / "05e_hist_depth_all.png")
+    _savefig(fig, out_dir / "05a_hist_depth_all.png")
 
+    # 05b: Sample counts per habitat class (bar chart)
     fig, ax = plt.subplots(figsize=(6, 4))
-    _draw_turbidity_log_all(ax, df)
-    _savefig(fig, out_dir / "05f_hist_turbidity_log_all.png")
+    habitat_counts = df["habitat_class"].value_counts()
+    colors = [HABITAT_PALETTE.get(h, "#888888") for h in habitat_counts.index]
+    ax.bar(habitat_counts.index, habitat_counts.values, color=colors, alpha=0.85, edgecolor="none")
+    ax.set_xlabel("Habitat class"); ax.set_ylabel("Count")
+    ax.set_title("Sample count by habitat class", fontsize=10)
+    ax.grid(True, linewidth=0.3, alpha=0.4, axis="y")
+    _savefig(fig, out_dir / "05b_hist_habitat_counts.png")
 
-    fig, axes = plt.subplots(2, 3, figsize=(18, 8))
-    for ax, (series_by_label, xlabel, title, _) in zip(axes.flat, hist_specs):
-        _draw_class_hist(ax, series_by_label, xlabel, title)
-    _draw_depth_all(axes[1, 1], df)
-    _draw_turbidity_log_all(axes[1, 2], df)
-    for row_axes in axes:
-        for ax in row_axes[1:]:
-            ax.set_ylabel("")
+    # 05c: Depth by habitat (overlaid)
+    valid = df.dropna(subset=["depth_m"]).copy()
+    fig, ax = plt.subplots(figsize=(6, 4))
+    depth_max = valid["depth_m"].quantile(0.99) if not valid.empty else 60
+    bins = np.linspace(0, max(depth_max, 1), 41)
+    for h, c in HABITAT_PALETTE.items():
+        sub = valid[valid["habitat_class"] == h]["depth_m"]
+        if sub.empty:
+            continue
+        ax.hist(sub, bins=bins, color=c, alpha=0.6, label=h, edgecolor="none")
+    ax.set_xlabel("Depth (m)"); ax.set_ylabel("Count")
+    ax.set_title("Depth distribution by habitat class", fontsize=10)
+    ax.legend(fontsize=8)
+    ax.grid(True, linewidth=0.3, alpha=0.4, axis="y")
+    _savefig(fig, out_dir / "05c_hist_depth_by_habitat.png")
+
+    fig, axes = plt.subplots(1, 3, figsize=(18, 4))
+    _draw_depth_all(axes[0], df)
+    axes[1].bar(habitat_counts.index, habitat_counts.values,
+                color=[HABITAT_PALETTE.get(h, "#888") for h in habitat_counts.index],
+                alpha=0.85, edgecolor="none")
+    axes[1].set_xlabel("Habitat class"); axes[1].set_ylabel("Count")
+    axes[1].set_title("Sample count by habitat class", fontsize=10)
+    axes[1].grid(True, linewidth=0.3, alpha=0.4, axis="y")
+    for h, c in HABITAT_PALETTE.items():
+        sub = valid[valid["habitat_class"] == h]["depth_m"] if not valid.empty else pd.Series()
+        if sub.empty:
+            continue
+        axes[2].hist(sub, bins=bins, color=c, alpha=0.6, label=h, edgecolor="none")
+    axes[2].set_xlabel("Depth (m)"); axes[2].set_ylabel("Count")
+    axes[2].set_title("Depth by habitat class", fontsize=10)
+    axes[2].legend(fontsize=8)
+    axes[2].grid(True, linewidth=0.3, alpha=0.4, axis="y")
     fig.suptitle("Class distribution histograms", fontsize=12)
     _savefig(fig, out_dir / "05_class_histograms.png")
 
@@ -726,11 +682,13 @@ def _draw_temporal_year(ax, df):
 
 def _draw_temporal_season(ax, df):
     season_order = ["Winter", "Spring", "Summer", "Autumn"]
+    hue_order = [h for h in HABITAT_PALETTE if h in df["habitat_class"].unique()]
     sns.countplot(data=df, x="season_label", order=season_order,
-                  hue="environment_class", palette=ENV_PALETTE, ax=ax, alpha=0.85)
+                  hue="habitat_class", hue_order=hue_order,
+                  palette=HABITAT_PALETTE, ax=ax, alpha=0.85)
     ax.set_xlabel("Season"); ax.set_ylabel("Count")
-    ax.set_title("Season distribution by environment class", fontsize=10)
-    ax.legend(title="environment", fontsize=8)
+    ax.set_title("Season distribution by habitat class", fontsize=10)
+    ax.legend(title="habitat", fontsize=8)
     ax.grid(True, linewidth=0.3, alpha=0.4, axis="y")
 
 
@@ -1166,9 +1124,9 @@ def _render_sample_row(axes, processed_dir: Path, loc_id: int, tag: str, meta: d
                        scale=_LR_SCALE, offset=_LR_OFFSET)
     hr_rgb = _load_rgb(processed_dir / sample / "sentinel2", *_HR_RGB,
                        scale=_HR_SCALE, offset=_HR_OFFSET)
-    env   = meta.get("environment_class", "?")
-    depth = meta.get("depth_class", "?")
-    turb  = meta.get("turbidity_class", "?")
+    habitat = meta.get("habitat_class", "?")
+    depth_m = meta.get("depth_m")
+    depth_str = f"{depth_m:.0f} m" if depth_m is not None else "?"
 
     for ax, rgb, sensor in zip(axes, [lr_rgb, hr_rgb], ["Landsat LR 30 m", "Sentinel-2 HR 10 m"]):
         if rgb is not None:
@@ -1180,7 +1138,7 @@ def _render_sample_row(axes, processed_dir: Path, loc_id: int, tag: str, meta: d
         ax.axis("off")
 
     # Overlay info text on the LR panel
-    info = f"#{loc_id}  {env} / {depth} / {turb}"
+    info = f"#{loc_id}  {habitat} / {depth_str}"
     if tag:
         info += f"\n{tag}"
     axes[0].text(0.02, 0.98, info,
@@ -1343,8 +1301,8 @@ def main():
     print("[01] Spatial distribution map")
     fig_spatial_distribution(df, out_dir)
 
-    print("[02] Depth–turbidity density")
-    fig_depth_turbidity_density(df, out_dir)
+    print("[02] Depth by habitat")
+    fig_depth_by_habitat(df, out_dir)
 
     ls_df = pd.DataFrame()
     s2_df = pd.DataFrame()

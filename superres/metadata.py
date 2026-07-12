@@ -100,11 +100,8 @@ class DatasetMetadata:
                     "longitude": sample["longitude"],
                     "season_id": sample.get("season_id", ""),
                     "province": sample.get("province", sample.get("ecoregion", "")),
-                    "environment_class": sample.get("environment_class", ""),
-                    "depth_class": sample.get("depth_class", ""),
+                    "habitat_class": sample.get("habitat_class", ""),
                     "depth_m": sample.get("depth_m", ""),
-                    "turbidity_class": sample.get("turbidity_class", ""),
-                    "turbidity_index": sample.get("turbidity_index", ""),
                     "date_range_start": date_range[0],
                     "date_range_end": date_range[1],
                     "alignment_crs": sample.get("alignment_crs", ""),
@@ -146,7 +143,7 @@ class DatasetMetadata:
                 row["longitude"] = float(row["longitude"])
                 if row.get("season_id") not in (None, ""):
                     row["season_id"] = int(row["season_id"])
-                for key in ("depth_m", "turbidity_index", "patch_size_meters", "target_origin_x", "target_origin_y"):
+                for key in ("depth_m", "patch_size_meters", "target_origin_x", "target_origin_y"):
                     if row.get(key) not in (None, ""):
                         row[key] = float(row[key])
                 for key in ("patch_size_pixels", "lowres_count", "highres_count"):
