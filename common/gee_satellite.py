@@ -111,13 +111,18 @@ class GEESatelliteManager:
         return cls.SPEC.resolution_meters
 
     def _initialise_ee(self) -> None:
-        """Initialise Earth Engine. Authentication is handled via cached OAuth."""
+        """Initialise Earth Engine. Authentication is handled via cached OAuth.
+
+        Uses the high-volume endpoint (Google's recommendation for scripted/
+        parallel access — the default interactive endpoint rate-limits much
+        more aggressively and isn't meant for batch workloads).
+        """
         try:
             if self.gee_project:
-                ee.Initialize(project=self.gee_project)
+                ee.Initialize(project=self.gee_project, opt_url=ee.data.HIGH_VOLUME_API_BASE_URL)
             else:
-                ee.Initialize()
-            self.logger.info("Earth Engine initialised successfully")
+                ee.Initialize(opt_url=ee.data.HIGH_VOLUME_API_BASE_URL)
+            self.logger.info("Earth Engine initialised successfully (high-volume endpoint)")
         except Exception as e:
             self.logger.warning(f"Could not initialise Earth Engine: {e}")
 
