@@ -33,7 +33,7 @@ def main() -> None:
     parser.add_argument("--site", choices=["tampabay", "indonesia"], required=True)
     parser.add_argument("-o", "--output", default=None, help="Output file or suffix (site-specific meaning)")
     parser.add_argument("--gee-project", default=None, help="Optional Earth Engine project id; defaults to shared credentials if available")
-    parser.add_argument("--acolite-dir", default=None, help="(tampabay) Directory of ACOLITE NetCDF output; primary imagery source when given")
+    parser.add_argument("--acolite-dir", default=None, help="Directory of ACOLITE NetCDF output; primary imagery source when given")
     parser.add_argument("--s2-window-days", type=int, default=None, help="(tampabay) Sentinel-2 date-matching window in days")
     args = parser.parse_args()
 
@@ -41,12 +41,17 @@ def main() -> None:
         mod = _load_module_from_pkg("indonesia")
         root = Path(args.root_dir) if args.root_dir else mod.DEFAULT_ROOT
         output_suffix = args.output if args.output is not None else "_with_bands"
-        mod.prepare_indonesia(root_dir=root, output_suffix=output_suffix, gee_project=args.gee_project)
+        mod.prepare_indonesia(
+            root_dir=root,
+            output_suffix=output_suffix,
+            gee_project=args.gee_project,
+            acolite_dir=Path(args.acolite_dir) if args.acolite_dir else None,
+        )
     else:
         mod = _load_module_from_pkg("tampa_bay")
         root = Path(args.root_dir) if args.root_dir else mod.DEFAULT_ROOT
         output_file = Path(args.output) if args.output else root / "tampa_bay_transects_prepared.csv"
-        s2_window_days = args.s2_window_days if args.s2_window_days is not None else mod.SENTINEL2_WINDOW_DAYS
+        s2_window_days = args.s2_window_days if args.s2_window_days is not None else mod.TAMPA_S2_WINDOW_DAYS
         mod.build_transect_csv(
             root_dir=root,
             output_file=output_file,

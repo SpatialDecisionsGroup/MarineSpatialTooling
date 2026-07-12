@@ -57,13 +57,17 @@ ACOLITE     : git clone https://github.com/acolite/acolite
 from __future__ import annotations
 
 import json
+import random
 import re
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import argparse
 import ee
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
 
 from common.common import format_date_window, parse_date_object, parse_date_value
 from common.credentials import load_credentials
@@ -302,16 +306,120 @@ def _init_output_columns(frame: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _apply_corrections(frame, row_index, band_cols, depth_m, kd_map, drc_cols,
-                        lyzenga_pairs, lyzenga_cols) -> None:
-    band_vals = {c: float(frame.at[row_index, c]) for c in band_cols}
+def _compute_corrections(band_vals: dict, depth_m: float, kd_map, drc_cols,
+                          lyzenga_pairs, lyzenga_cols) -> dict:
+    """Pure version of the old frame-mutating _apply_corrections — safe to call from worker threads."""
+    band_vals = {c: float(v) for c, v in band_vals.items()}
+    out: dict = {}
     if not np.isnan(depth_m) and depth_m > 0:
         drc = add_depth_corrected_columns(dict(band_vals), depth_m, kd_map)
-        for col in drc_cols:
-            frame.at[row_index, col] = drc.get(col, np.nan)
+        out.update({col: drc.get(col, np.nan) for col in drc_cols})
     lyz = add_lyzenga_columns(dict(band_vals), lyzenga_pairs)
-    for col in lyzenga_cols:
-        frame.at[row_index, col] = lyz.get(col, np.nan)
+    out.update({col: lyz.get(col, np.nan) for col in lyzenga_cols})
+    return out
+
+
+def _with_retries(fn, attempts: int = 3, base_delay: float = 1.5):
+    """Retry fn() a few times with backoff — cheap even on a genuine no-data result,
+    but recovers from transient GEE rate-limit/network hiccups under parallel load."""
+    result = None
+    for attempt in range(attempts):
+        try:
+            result = fn()
+        except Exception:
+            result = None
+        if result:
+            return result
+        if attempt < attempts - 1:
+            time.sleep(base_delay * (attempt + 1) + random.uniform(0, 0.5))
+    return result
+
+
+def _process_row(
+    row_index: int,
+    lon: float,
+    lat: float,
+    obs_date: str,
+    depth_m: float,
+    s2_mgr: "Sentinel2Manager | None",
+    ls_mgr: "LandsatManager | None",
+    acolite_scenes: list[dict],
+    sentinel2_window_days: int,
+) -> dict:
+    """Compute every S2/Landsat column for one observation. Touches no shared
+    state (no DataFrame access) — safe to run concurrently in a thread pool."""
+    result: dict = {"row_index": row_index, "s2_hit": False, "ls_hit": False}
+
+    # Sentinel-2
+    s2_feat: dict | None = None
+    s2_date = ""
+    s2_src = ""
+
+    s2_scene = select_acolite_scene(acolite_scenes, obs_date, "S2", sentinel2_window_days)
+    if s2_scene:
+        sampled = sample_acolite_nc(s2_scene["path"], lon, lat, ACOLITE_S2_BAND_MAP)
+        if sampled:
+            s2_feat = sampled
+            compute_sentinel2_indices(s2_feat)
+            s2_date = parse_date_value(s2_scene["date"])
+            s2_src = "acolite"
+
+    if not s2_feat and s2_mgr:
+        s2_feat = _with_retries(lambda: _sample_gee_point(
+            s2_mgr, lon, lat, obs_date, sentinel2_window_days, SENTINEL2_DOWNLOAD_BANDS,
+            10, 15, build_sentinel2_feature_values,
+        ))
+        if s2_feat:
+            s2_date = s2_feat.get("scene_date", "")
+            s2_src = "gee"
+
+    if s2_feat:
+        for col in SENTINEL2_BAND_COLUMNS + list(SENTINEL2_INDEX_COLUMNS):
+            result[col] = s2_feat.get(col, np.nan)
+        result["s2_scene_date"] = s2_date
+        result["s2_source"] = s2_src
+        band_vals = {c: s2_feat.get(c, np.nan) for c in SENTINEL2_BAND_COLUMNS}
+        result.update(_compute_corrections(band_vals, depth_m, S2_KD, S2_DRC_COLUMNS,
+                                            S2_LYZENGA_PAIRS, S2_LYZENGA_COLUMNS))
+        result["s2_hit"] = True
+
+    # Landsat
+    ls_feat: dict | None = None
+    ls_date = ""
+    ls_src = ""
+
+    ls_scene = select_acolite_scene(acolite_scenes, obs_date, "LS", TAMPA_LS_WINDOW_DAYS)
+    if ls_scene:
+        sampled = sample_acolite_nc(ls_scene["path"], lon, lat, ACOLITE_LS_BAND_MAP)
+        if sampled:
+            ls_feat = sampled
+            compute_landsat_indices(ls_feat)
+            ls_date = parse_date_value(ls_scene["date"])
+            ls_src = "acolite"
+
+    if not ls_feat and ls_mgr:
+        ls_feat = _with_retries(lambda: _sample_gee_point(
+            ls_mgr, lon, lat, obs_date, TAMPA_LS_WINDOW_DAYS, LANDSAT_DOWNLOAD_BANDS,
+            30, 45, build_landsat_feature_values,
+        ))
+        if ls_feat:
+            ls_date = ls_feat.get("ls_scene_date", "")
+            ls_src = "gee"
+
+    if ls_feat:
+        for col in LANDSAT_BAND_COLUMNS + LANDSAT_INDEX_COLUMNS:
+            result[col] = ls_feat.get(col, np.nan)
+        result["ls_scene_date"] = ls_date
+        result["ls_source"] = ls_src
+        band_vals = {c: ls_feat.get(c, np.nan) for c in LANDSAT_BAND_COLUMNS}
+        result.update(_compute_corrections(band_vals, depth_m, LS_KD, LS_DRC_COLUMNS,
+                                            LS_LYZENGA_PAIRS, LS_LYZENGA_COLUMNS))
+        result["ls_hit"] = True
+
+    return result
+
+
+CHECKPOINT_EVERY = 100
 
 
 def _sensor_output_path(output_file: Path, sensor: str) -> Path:
@@ -331,8 +439,15 @@ def build_transect_csv(
     gee_project: str | None = None,
     acolite_dir: Path | None = None,
     sentinel2_window_days: int = TAMPA_S2_WINDOW_DAYS,
+    max_workers: int = 8,
 ) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Build the Tampa Bay transect dataset.
+
+    Samples GEE/ACOLITE for `max_workers` rows concurrently (thread pool — the
+    work is network-bound, not CPU-bound), and checkpoints progress to
+    <output>.checkpoint.csv every CHECKPOINT_EVERY completed rows. If this run
+    is interrupted, rerunning the exact same command resumes from there instead
+    of starting over.
 
     Writes two CSVs (Sentinel-2 and Landsat, each with the shared observation
     columns) next to `output_file`, in the same one-CSV-per-sensor style as
@@ -347,6 +462,25 @@ def build_transect_csv(
     frame = load_json_to_frame(root_dir / JSON_FILE, endpoints)
     print(f"Loaded {len(frame)} observations from JSON")
     frame = _init_output_columns(frame)
+    frame["_done"] = False
+
+    checkpoint_path = output_file.with_name(f"{output_file.stem}.checkpoint.csv")
+    if checkpoint_path.exists():
+        try:
+            checkpoint = pd.read_csv(checkpoint_path)
+            same_data = (
+                len(checkpoint) == len(frame)
+                and "record_id" in checkpoint.columns
+                and checkpoint["record_id"].astype(str).equals(frame["record_id"].astype(str))
+            )
+        except Exception:
+            checkpoint, same_data = None, False
+        if same_data:
+            frame = checkpoint
+            frame["_done"] = frame["_done"].fillna(False).astype(bool)
+            print(f"Resuming from checkpoint: {int(frame['_done'].sum())}/{len(frame)} rows already done")
+        else:
+            print(f"Checkpoint at {checkpoint_path} doesn't match this data; starting fresh")
 
     acolite_scenes: list[dict] = []
     if acolite_dir is not None and acolite_dir.exists():
@@ -365,83 +499,69 @@ def build_transect_csv(
         s2_mgr = Sentinel2Manager(gee_project=gee_project)
         ls_mgr = LandsatManager(gee_project=gee_project)
 
-    s2_hits = 0
-    ls_hits = 0
-    pbar = tqdm(frame.iterrows(), total=len(frame), desc="Sampling imagery", unit="obs")
-    for row_index, row in pbar:
-        lon = float(row["longitude"])
-        lat = float(row["latitude"])
-        obs_date = str(row["observation_date"]).strip()
-        depth_m = float(row["depth_m"]) if pd.notna(row["depth_m"]) else np.nan
-        if not obs_date or obs_date == "nan":
+    pending: list[tuple[int, float, float, str, float]] = []
+    for row_index, row in frame.iterrows():
+        if bool(row["_done"]):
             continue
+        obs_date = str(row["observation_date"]).strip()
+        if not obs_date or obs_date == "nan":
+            frame.at[row_index, "_done"] = True
+            continue
+        depth_m = float(row["depth_m"]) if pd.notna(row["depth_m"]) else np.nan
+        pending.append((row_index, float(row["longitude"]), float(row["latitude"]), obs_date, depth_m))
 
-        # Sentinel-2
-        s2_feat: dict | None = None
-        s2_date = ""
-        s2_src = ""
+    s2_hits = int(frame["s2_source"].isin(["acolite", "gee"]).sum())
+    ls_hits = int(frame["ls_source"].isin(["acolite", "gee"]).sum())
 
-        s2_scene = select_acolite_scene(acolite_scenes, obs_date, "S2", sentinel2_window_days)
-        if s2_scene:
-            sampled = sample_acolite_nc(s2_scene["path"], lon, lat, ACOLITE_S2_BAND_MAP)
-            if sampled:
-                s2_feat = sampled
-                compute_sentinel2_indices(s2_feat)
-                s2_date = parse_date_value(s2_scene["date"])
-                s2_src = "acolite"
+    def _save_checkpoint() -> None:
+        tmp = checkpoint_path.with_suffix(".tmp")
+        frame.to_csv(tmp, index=False)
+        tmp.rename(checkpoint_path)
 
-        if not s2_feat and s2_mgr:
-            s2_feat = _sample_gee_point(s2_mgr, lon, lat, obs_date,
-                                         sentinel2_window_days, SENTINEL2_DOWNLOAD_BANDS,
-                                         10, 15, build_sentinel2_feature_values)
-            if s2_feat:
-                s2_date = s2_feat.get("scene_date", "")
-                s2_src = "gee"
+    pbar = tqdm(total=len(frame), initial=len(frame) - len(pending),
+                desc="Sampling imagery", unit="obs")
+    pbar.set_postfix(s2=s2_hits, ls=ls_hits)
 
-        if s2_feat:
-            for col in SENTINEL2_BAND_COLUMNS + list(SENTINEL2_INDEX_COLUMNS):
-                frame.at[row_index, col] = s2_feat.get(col, np.nan)
-            frame.at[row_index, "s2_scene_date"] = s2_date
-            frame.at[row_index, "s2_source"] = s2_src
-            _apply_corrections(frame, row_index, SENTINEL2_BAND_COLUMNS, depth_m,
-                                S2_KD, S2_DRC_COLUMNS, S2_LYZENGA_PAIRS, S2_LYZENGA_COLUMNS)
-            s2_hits += 1
+    completed_since_checkpoint = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_process_row, row_index, lon, lat, obs_date, depth_m,
+                             s2_mgr, ls_mgr, acolite_scenes, sentinel2_window_days): row_index
+            for row_index, lon, lat, obs_date, depth_m in pending
+        }
+        for future in as_completed(futures):
+            row_index = futures[future]
+            try:
+                result = future.result()
+            except Exception as exc:
+                print(f"\nRow {row_index} failed: {exc}")
+                result = {"row_index": row_index, "s2_hit": False, "ls_hit": False}
 
-        # Landsat
-        ls_feat: dict | None = None
-        ls_date = ""
-        ls_src = ""
+            for col, val in result.items():
+                if col in ("row_index", "s2_hit", "ls_hit"):
+                    continue
+                frame.at[row_index, col] = val
+            frame.at[row_index, "_done"] = True
+            s2_hits += int(result.get("s2_hit", False))
+            ls_hits += int(result.get("ls_hit", False))
 
-        ls_scene = select_acolite_scene(acolite_scenes, obs_date, "LS", TAMPA_LS_WINDOW_DAYS)
-        if ls_scene:
-            sampled = sample_acolite_nc(ls_scene["path"], lon, lat, ACOLITE_LS_BAND_MAP)
-            if sampled:
-                ls_feat = sampled
-                compute_landsat_indices(ls_feat)
-                ls_date = parse_date_value(ls_scene["date"])
-                ls_src = "acolite"
+            pbar.update(1)
+            pbar.set_postfix(s2=s2_hits, ls=ls_hits)
 
-        if not ls_feat and ls_mgr:
-            ls_feat = _sample_gee_point(ls_mgr, lon, lat, obs_date,
-                                         TAMPA_LS_WINDOW_DAYS, LANDSAT_DOWNLOAD_BANDS,
-                                         30, 45, build_landsat_feature_values)
-            if ls_feat:
-                ls_date = ls_feat.get("ls_scene_date", "")
-                ls_src = "gee"
+            completed_since_checkpoint += 1
+            if completed_since_checkpoint >= CHECKPOINT_EVERY:
+                _save_checkpoint()
+                completed_since_checkpoint = 0
 
-        if ls_feat:
-            for col in LANDSAT_BAND_COLUMNS + LANDSAT_INDEX_COLUMNS:
-                frame.at[row_index, col] = ls_feat.get(col, np.nan)
-            frame.at[row_index, "ls_scene_date"] = ls_date
-            frame.at[row_index, "ls_source"] = ls_src
-            _apply_corrections(frame, row_index, LANDSAT_BAND_COLUMNS, depth_m,
-                                LS_KD, LS_DRC_COLUMNS, LS_LYZENGA_PAIRS, LS_LYZENGA_COLUMNS)
+    pbar.close()
+    if pending:
+        _save_checkpoint()
 
     s2_only_cols = (SENTINEL2_BAND_COLUMNS + list(SENTINEL2_INDEX_COLUMNS)
                     + ["s2_scene_date", "s2_source"] + S2_DRC_COLUMNS + S2_LYZENGA_COLUMNS)
     ls_only_cols = (LANDSAT_BAND_COLUMNS + LANDSAT_INDEX_COLUMNS
                     + ["ls_scene_date", "ls_source"] + LS_DRC_COLUMNS + LS_LYZENGA_COLUMNS)
-    shared_cols = [c for c in frame.columns if c not in s2_only_cols + ls_only_cols]
+    shared_cols = [c for c in frame.columns if c not in s2_only_cols + ls_only_cols + ["_done"]]
 
     s2_frame = frame[shared_cols + s2_only_cols]
     ls_frame = frame[shared_cols + ls_only_cols]
@@ -452,6 +572,8 @@ def build_transect_csv(
     print(f"Wrote {s2_out}")
     ls_frame.to_csv(ls_out, index=False)
     print(f"Wrote {ls_out}")
+
+    checkpoint_path.unlink(missing_ok=True)
     return s2_frame, ls_frame
 
 
@@ -508,6 +630,7 @@ def _cmd_build(args) -> None:
         gee_project=args.gee_project,
         acolite_dir=Path(args.acolite_dir) if args.acolite_dir else None,
         sentinel2_window_days=args.s2_window_days,
+        max_workers=args.workers,
     )
 
 
@@ -532,6 +655,7 @@ def _cmd_all(args) -> None:
         gee_project=args.gee_project,
         acolite_dir=acolite_out,
         sentinel2_window_days=args.s2_window_days,
+        max_workers=args.workers,
     )
 
 
@@ -572,6 +696,8 @@ if __name__ == "__main__":
     p.add_argument("--acolite-dir", metavar="DIR",
                    help="Directory of ACOLITE NetCDF output (primary imagery source)")
     p.add_argument("--s2-window-days", type=int, default=TAMPA_S2_WINDOW_DAYS)
+    p.add_argument("--workers", type=int, default=8,
+                   help="Concurrent GEE sampling threads (default 8)")
 
     # all
     p = sub.add_parser("all", help="Run the full pipeline in one go")
@@ -588,6 +714,8 @@ if __name__ == "__main__":
     p.add_argument("--output", "-o", default="tampa_transects_with_bands.csv",
                    help="Base filename; writes <base>_sentinel2<suffix> and <base>_landsat<suffix>")
     p.add_argument("--s2-window-days", type=int, default=TAMPA_S2_WINDOW_DAYS)
+    p.add_argument("--workers", type=int, default=8,
+                   help="Concurrent GEE sampling threads (default 8)")
 
     args = parser.parse_args()
     dispatch = {
