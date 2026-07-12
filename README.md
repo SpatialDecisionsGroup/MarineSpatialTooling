@@ -1,17 +1,20 @@
-# Super-Resolution Dataset Creator
+# Marine Super-Resolution Dataset Creator
 
-A modular Python framework for creating and downloading multi-image super-resolution datasets from satellite imagery.
+A modular Python framework for creating and downloading multi-image super-resolution datasets from satellite imagery, stratified by coral, seagrass, and mangrove habitat.
 
 ## Table of Contents
 
 - [Dependencies](#dependencies)
 - [Workflow](#workflow)
+  - [0. Download Habitat Extents](#0-download-habitat-extents)
   - [1. Setup Credentials](#1-setup-credentials)
   - [2. Create Dataset Manifest](#2-create-dataset-manifest)
   - [3. Download and Preprocess Data](#3-download-and-preprocess-data)
   - [4. Postprocess](#4-postprocess)
-  - [5. Tile the Dataset](#5-tile-the-dataset-optional)
-  - [6. Check Dataset Integrity](#6-check-dataset-integrity-optional)
+  - [5. Review Dataset](#5-review-dataset)
+  - [6. Tile the Dataset](#6-tile-the-dataset-optional)
+  - [7. Check Dataset Integrity](#7-check-dataset-integrity-optional)
+  - [8. Analyse Dataset](#8-analyse-dataset-optional)
 - [Resuming & Growing the Dataset](#resuming--growing-the-dataset)
   - [Growing the manifest](#growing-the-manifest-create)
   - [Incremental downloads](#incremental-downloads-download)
@@ -47,6 +50,24 @@ Required packages:
 All scripts are run through `uv run`, which uses the project's `uv.lock`/`pyproject.toml`
 environment. Replace `uv run python` with `python` if you manage your own virtualenv.
 
+### 0. Download Habitat Extents
+
+Download the global coral, seagrass, and mangrove polygon datasets used for sampling:
+
+```bash
+bash habitat_extents.sh
+```
+
+This downloads three open datasets into `data/habitat_extents/`:
+
+| Subdirectory | Dataset | Source |
+| --- | --- | --- |
+| `coral/` | UNEP-WCMC Global Coral Reefs v4.1 | wcmc.io/WCMC_008 |
+| `seagrass/` | UNEP-WCMC Global Seagrasses v7.1 | wcmc.io/WCMC_013_014 |
+| `mangrove/` | Global Mangrove Watch v4.0.19 (2020) | Zenodo 12756047 |
+
+All three are CC BY 4.0. Requires `curl`, `unzip`, and `python3`.
+
 ### 1. Setup Credentials
 
 ```bash
@@ -74,20 +95,29 @@ If you skip either credential, you can re-run the setup script later to complete
 uv run python superres.py create \
   -n 1000 \
   --coastline-dir ./data/gshhg-shp-2.3.7 \
-  --gebco-file ./data/gebco_2026_geotiff
+  --gebco-file ./data/gebco_2026_geotiff \
+  --habitat-extents-dir ./data/habitat_extents
 ```
 
 **Arguments:**
 
 - `-o, --output`: Output directory (default: `./superres`)
 - `-n, --total-samples` or `-p, --samples-per-area`: total sample count, or samples per
-  environment/depth/turbidity stratum (one is required)
+  habitat stratum (one is required)
+- `--habitat-extents-dir`: Directory containing coral/seagrass/mangrove polygon subdirectories
+  downloaded by `habitat_extents.sh` (default: `./data/habitat_extents`)
 - `--coastline-dir`: Path to the GSHHG/WDBII coastline dataset (default `./data/gshhg-shp-2.3.7`)
-- `--gebco-file`: Path to the GEBCO bathymetry raster (default `./data/gebco_2026_geotiff`)
-- `--turbidity-file`: Path to a turbidity raster/NetCDF (default `./data/turbidity.nc`)
-- `--include-ecoregions` / `--exclude-ecoregions`: comma-separated MEOW province names
+- `--gebco-file`: Path to the GEBCO bathymetry raster used for depth metadata (default `./data/gebco_2026_geotiff`)
+- `--turbidity-file`: Path to a Kd490/turbidity raster used for the bottom-visibility check
+  on coral and seagrass sites (default `./data/turbidity.nc`; check is skipped if file is absent)
 - `--resume`: continue from an existing `dataset_metadata.json` instead of starting over
   (see [Resuming & Growing the Dataset](#resuming--growing-the-dataset))
+
+Samples are drawn in equal amounts from coral, seagrass, and mangrove habitat polygons.
+For coral and seagrass, sites are additionally filtered by a Kd490 bottom-visibility
+threshold (`BOTTOM_VISIBILITY_KD490_MAX = 0.3 m⁻¹`) so only optically shallow sites are included.
+On resume, any existing samples that predate the habitat-based schema are automatically
+deleted and their IDs reused.
 
 The scripts load credentials automatically from `./superres/credentials/credentials.json`.
 
@@ -136,7 +166,21 @@ For each completed sample, this:
 
 Output mirrors the input `sample_*/` layout under the output directory; the raw originals are not modified.
 
-### 5. Tile the Dataset (optional)
+### 5. Review Dataset
+
+Visually inspect downloaded samples and flag individual images for replacement or deletion:
+
+```bash
+uv run streamlit run superres/review_dataset.py -- --data-dir data/landsat2sentinel/data
+```
+
+The Streamlit app shows all Landsat images and the Sentinel-2 image for each sample.
+Click individual Landsat thumbnails to select them for partial replacement, or use the
+action buttons (Keep / Replace LR / Replace HR / Replace Both / Delete) to record a
+decision. Decisions are written to `<data-dir>/../review_decisions.json` and survive
+page refreshes.
+
+### 6. Tile the Dataset (optional)
 
 ```bash
 uv run python superres.py tile superres/data -o ./superres/output
@@ -150,7 +194,7 @@ uv run python superres.py tile superres/data -o ./superres/output
 
 Writes fixed-size training tiles to `<output>/tiles/<satellite>/`.
 
-### 6. Check Dataset Integrity (optional)
+### 7. Check Dataset Integrity (optional)
 
 ```bash
 uv run python superres.py check superres/data --manifest superres/metadata/dataset_manifest.csv
@@ -163,6 +207,28 @@ uv run python superres.py check superres/data --manifest superres/metadata/datas
 - `--verbose`: Print per-file detail for every issue
 
 Validates every sample for: directory structure, `sample_metadata.json` presence and validity, file counts, raster integrity (openable by rasterio, correct band count), dimensions (LR non-degenerate, HR exactly `patch_size_pixels × patch_size_pixels`), georeferencing (CRS, pixel size, origin), and non-zero centre values.
+
+### 8. Analyse Dataset (optional)
+
+Generate a full set of analysis figures (spatial maps, spectral violins, PSD curves, alignment diagnostics, sample thumbnails):
+
+```bash
+uv run python -m superres.analyse_dataset \
+    data/landsat2sentinel/metadata/dataset_manifest.csv \
+    data/landsat2sentinel/data \
+    --processed-dir data/landsat2sentinel/processed \
+    --output figures/dataset_analysis
+```
+
+**Arguments:**
+
+- `manifest`: Path to `dataset_manifest.csv` (positional)
+- `data_dir`: Path to the `data/` directory containing `sample_*/` folders (positional)
+- `--processed-dir`: Path to postprocessed rasters (default: `<data_dir>/../processed`)
+- `-o, --output`: Output directory for figures (default: `figures/dataset_analysis`)
+- `--n-band-samples`: Number of random samples used for spectral/PSD/histogram figures (default: 150)
+- `--skip-rasters`: Skip all raster-reading figures (figs 3–4, 8–11); fast summary only
+- `--images`: Only generate sample thumbnail grids (fig 11); skip everything else
 
 ## Resuming & Growing the Dataset
 
@@ -177,14 +243,16 @@ Re-run with `--resume` and a larger `-n`/`-p`:
 ```bash
 uv run python superres.py create -n 2000 --resume \
   --coastline-dir ./data/gshhg-shp-2.3.7 \
-  --gebco-file ./data/gebco_2026_geotiff
+  --gebco-file ./data/gebco_2026_geotiff \
+  --habitat-extents-dir ./data/habitat_extents
 ```
 
 This loads the existing `dataset_metadata.json`, keeps every sample already collected
-(their `location_id`s are preserved), counts how many samples exist per
-environment/depth/turbidity stratum, and only samples the difference needed to reach the
-new total. `dataset_metadata.json` and `dataset_manifest.csv` are rewritten with the full
-(old + new) sample list.
+(their `location_id`s are preserved), counts how many samples exist per habitat class
+(coral / seagrass / mangrove), and only samples the difference needed to reach the new
+total. Any existing samples that predate the habitat schema are automatically deleted and
+their IDs reused. `dataset_metadata.json` and `dataset_manifest.csv` are rewritten with
+the full (old + new) sample list.
 
 ### Incremental downloads (`download`)
 
@@ -254,9 +322,10 @@ re-running `download` will pick up where it left off (see
 - **Sentinel-2**: 13 spectral bands at 10m–60m resolution
 - **Landsat 8/9**: 11 bands (Collection 2 Level-2 SR) at 30m resolution
 - **PlanetScope**: 8 spectral bands at 3m resolution
-- **Focus**: Global shallow-water patches stratified by environment, depth, and turbidity
+- **Focus**: Global shallow-water patches at coral, seagrass, and mangrove habitat sites
+- **Stratification**: Equal samples per habitat class; coral/seagrass sites filtered by Kd490 bottom visibility
 - **Cloud Cover**: Max 20%
-- **Sampling**: Proportional to ecoregion area, diverse seasons
+- **Patch size**: 512 × 512 pixels at the high-res satellite's native resolution (5120 m at 10 m/px for Sentinel-2)
 
 ## Seasons
 
@@ -319,7 +388,8 @@ different `-o` to keep generated data separate from the code.
 - **`superres/postprocess.py`** - Reprojects the low-res image stack onto the high-res grid and rescales all rasters to surface reflectance
 - **`superres/tile_dataset.py`** - Tiles downloaded rasters into fixed-size training patches
 - **`superres/check_dataset.py`** - Validates every sample for structural integrity, raster dimensions, georeferencing, and non-zero values
-- **`superres/analyse_dataset.py`** - Generates a comprehensive set of analysis figures (spatial maps, spectral violins, temporal coverage, PSD curves, alignment diagnostics, etc.)
+- **`superres/analyse_dataset.py`** - Generates a comprehensive set of analysis figures (spatial maps, spectral violins, temporal coverage, PSD curves, alignment diagnostics, sample thumbnails)
+- **`superres/review_dataset.py`** - Streamlit GUI for visually reviewing samples; flag images for replacement or deletion; run with `uv run streamlit run superres/review_dataset.py -- --data-dir <data_dir>`
 - **`superres/drop_samples.py`** - Removes specific samples from metadata and disk so they can be regenerated
 - **`setup_credentials.py`** - Sets up API credentials securely in JSON format
 
@@ -374,6 +444,17 @@ layout from Planet Orders). Outputs:
 - `summary_combined_landsat_with_bands.csv`
 - `summary_combined_sentinel2_with_bands.csv`
 - `summary_combined_planetscope_with_bands.csv` (if PlanetScope folders are present)
+
+Sentinel-2/Landsat band sampling picks the AOI-locally-clearest scene within a
+±60-day window (Cloud Score+ for S2, the QA_PIXEL "Clear" bit for Landsat) rather
+than trusting whole-tile cloud-cover metadata, and samples the same physical
+footprint (45m box) for both sensors so cross-sensor comparisons aren't skewed by
+resolution. `seagrass.py --site indonesia` only runs this build step. The 9 sites
+fall into two clusters ~200km apart (Bawean / Baluran); to download raw Level-1
+scenes and run ACOLITE (water-optimised atmospheric correction) yourself, use
+`seagrass/indonesia.py` directly — it has `dates`/`download`/`acolite`/`build`
+subcommands per cluster; run `uv run python seagrass/indonesia.py --help` or see
+the module docstring for the full pipeline.
 
 ### Tampa Bay (`seagrass/tampa_bay.py`)
 
