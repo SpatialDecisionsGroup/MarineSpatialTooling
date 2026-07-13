@@ -42,10 +42,15 @@ ACOLITE_REPO_PATH = Path(__file__).resolve().parent.parent.parent / "acolite"
 _DATE_RE = re.compile(r"(\d{4})[_\-](\d{2})[_\-](\d{2})")
 
 _M2M = "https://m2m.cr.usgs.gov/api/api/json/stable"
-_LS_DATASETS = [
-    "landsat_ot_c2_l1",    # Landsat 8/9
-    "landsat_etm_c2_l1",   # Landsat 7
-    "landsat_tm_c2_l1",    # Landsat 4/5
+# (dataset name, operational start, operational end or None if ongoing).
+# Landsat 5 TM was decommissioned 2013-06-05; querying M2M's scene-search for
+# a dataset+date range years past the satellite's retirement has been observed
+# to return a 500 rather than an empty result set, so windows outside a
+# dataset's real operational range are skipped entirely rather than queried.
+_LS_DATASETS: list[tuple[str, date, date | None]] = [
+    ("landsat_ot_c2_l1", date(2013, 3, 18), None),               # Landsat 8/9
+    ("landsat_etm_c2_l1", date(1999, 4, 15), None),               # Landsat 7
+    ("landsat_tm_c2_l1", date(1982, 7, 16), date(2013, 6, 5)),    # Landsat 4/5
 ]
 
 
@@ -144,17 +149,22 @@ def download_sentinel2(
             "$orderby": "ContentDate/Start",
             "$top": 100,
         }
-        resp = session.get(
-            "https://catalogue.dataspace.copernicus.eu/odata/v1/Products",
-            params=params, timeout=60,
-        )
-        resp.raise_for_status()
-        for product in resp.json().get("value", []):
-            pid = product["Id"]
-            if pid in seen:
-                continue
-            seen.add(pid)
-            products.append(product)
+        url = "https://catalogue.dataspace.copernicus.eu/odata/v1/Products"
+        request_params = params
+        while url:
+            resp = session.get(url, params=request_params, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+            for product in data.get("value", []):
+                pid = product["Id"]
+                if pid in seen:
+                    continue
+                seen.add(pid)
+                products.append(product)
+            # $top caps each page at 100; follow nextLink so a window with
+            # more matches than that isn't silently truncated.
+            url = data.get("@odata.nextLink")
+            request_params = None
 
     to_fetch = [p for p in products if not (scenes_dir / f"{p['Name']}.zip").exists()]
     print(f"Found {len(products)} scene(s); "
@@ -177,13 +187,33 @@ def download_sentinel2(
     return n
 
 
-def _m2m(session, endpoint: str, payload: dict) -> dict:
-    resp = session.post(f"{_M2M}/{endpoint}", json=payload, timeout=60)
-    resp.raise_for_status()
-    data = resp.json()
-    if data.get("errorCode"):
-        raise RuntimeError(f"M2M {data['errorCode']}: {data.get('errorMessage')}")
-    return data.get("data") or {}
+def _m2m(session, endpoint: str, payload: dict, attempts: int = 4, base_delay: float = 3.0) -> dict:
+    """POST to the USGS M2M API, retrying transient network/server hiccups
+    (the endpoint is prone to read timeouts under load). Doesn't retry 4xx
+    errors (bad credentials etc.) or M2M-reported errorCodes — those need a
+    fix, not a retry."""
+    import requests
+    last_exc: Exception | None = None
+    for attempt in range(attempts):
+        try:
+            resp = session.post(f"{_M2M}/{endpoint}", json=payload, timeout=60)
+            resp.raise_for_status()
+            data = resp.json()
+            if data.get("errorCode"):
+                raise RuntimeError(f"M2M {data['errorCode']}: {data.get('errorMessage')}")
+            return data.get("data") or {}
+        except (requests.exceptions.Timeout, requests.exceptions.ConnectionError) as exc:
+            last_exc = exc
+        except requests.exceptions.HTTPError as exc:
+            if exc.response is not None and exc.response.status_code < 500:
+                raise
+            last_exc = exc
+        if attempt < attempts - 1:
+            delay = base_delay * (2 ** attempt)
+            print(f"  M2M {endpoint} request failed ({last_exc}); "
+                  f"retrying in {delay:.0f}s (attempt {attempt + 2}/{attempts})…")
+            time.sleep(delay)
+    raise last_exc
 
 
 def download_landsat(
@@ -208,8 +238,12 @@ def download_landsat(
 
     to_dl: list[dict] = []
     seen: set[str] = set()
-    for ds_name in _LS_DATASETS:
+    for ds_name, ds_start, ds_end in _LS_DATASETS:
         for date_start, date_end in windows:
+            window_start = date.fromisoformat(date_start)
+            window_end = date.fromisoformat(date_end)
+            if window_end < ds_start or (ds_end is not None and window_start > ds_end):
+                continue
             result = _m2m(session, "scene-search", {
                 "datasetName": ds_name,
                 "spatialFilter": {

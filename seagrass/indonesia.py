@@ -46,7 +46,7 @@ ACOLITE     : see common/acolite_pipeline.py's module docstring.
 
 from __future__ import annotations
 import re
-from datetime import datetime, timedelta
+from datetime import timedelta
 from pathlib import Path
 
 import ee
@@ -57,6 +57,11 @@ from rasterio.windows import Window
 from rasterio.warp import transform as transform_coordinates
 
 from common.credentials import load_credentials
+from common.gee_clear_sky import (
+    s2_local_clear_candidates,
+    landsat_local_clear_candidates,
+    select_by_local_clarity,
+)
 from common.sentinel import (
     SENTINEL2_BAND_COLUMNS,
     SENTINEL2_DOWNLOAD_BANDS,
@@ -108,17 +113,6 @@ PS_BAND_SCALE = 10000.0
 # so a narrow window can miss every clear scene entirely.
 INDONESIA_S2_WINDOW_DAYS = 60
 INDONESIA_LS_WINDOW_DAYS = 60
-
-# Scene-level CLOUDY_PIXEL_PERCENTAGE / CLOUD_COVER is a whole-tile average, which
-# can look fine while the small reef AOI itself sits under a cloud. Score cloud
-# cover directly over the sample point instead: Sentinel-2 via Cloud Score+'s "cs"
-# band (0=cloud, 1=clear), Landsat via the QA_PIXEL "Clear" bit (bit 6).
-S2_CLOUD_SCORE_COLLECTION = "GOOGLE/CLOUD_SCORE_PLUS/V1/S2_HARMONIZED"
-LOCAL_CLARITY_BUFFER_M = 45
-
-# Local clear-score tiers to try in order (0-1, higher = clearer); the first tier
-# with any candidate wins, and the closest-by-date scene within that tier is used.
-CLEAR_SCORE_TIERS = (0.75, 0.6, 0.4)
 
 # Ground footprint sampled around each observation point for band extraction.
 # This must be a fixed physical size shared across sensors, NOT a fixed pixel
@@ -281,94 +275,6 @@ def select_scene_by_date(files: list[Path], row: pd.Series) -> Path:
 
     return files[0]
 
-
-def _s2_local_clear_candidates(
-    lon: float, lat: float, date_start: str, date_end: str,
-    buffer_m: float = LOCAL_CLARITY_BUFFER_M,
-) -> list[dict]:
-    """Sentinel-2 candidates in the window, scored by Cloud Score+ AOI-local clarity."""
-    point = ee.Geometry.Point([lon, lat]).buffer(buffer_m).bounds()
-    s2 = (ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
-          .filterBounds(point).filterDate(date_start, date_end))
-    cs_plus = ee.ImageCollection(S2_CLOUD_SCORE_COLLECTION)
-    linked = s2.linkCollection(cs_plus, ["cs"])
-
-    def _tag(img):
-        local_cs = img.select("cs").reduceRegion(ee.Reducer.mean(), point, 10).get("cs")
-        return img.set("local_clear_score", local_cs).set("full_asset_id", img.get("system:id"))
-
-    info = linked.map(_tag).select([]).getInfo()
-    return _candidates_from_feature_info(info)
-
-
-def _landsat_local_clear_candidates(
-    lon: float, lat: float, date_start: str, date_end: str,
-    buffer_m: float = LOCAL_CLARITY_BUFFER_M,
-) -> list[dict]:
-    """Landsat candidates in the window, scored by fraction of QA_PIXEL "Clear" pixels over the AOI."""
-    point = ee.Geometry.Point([lon, lat]).buffer(buffer_m).bounds()
-    coll = (ee.ImageCollection("LANDSAT/LC08/C02/T1_L2")
-            .merge(ee.ImageCollection("LANDSAT/LC09/C02/T1_L2"))
-            .filterBounds(point).filterDate(date_start, date_end))
-
-    def _tag(img):
-        clear_bit = img.select("QA_PIXEL").bitwiseAnd(1 << 6).gt(0).rename("clear")
-        local_clear = clear_bit.reduceRegion(ee.Reducer.mean(), point, 30).get("clear")
-        return img.set("local_clear_score", local_clear).set("full_asset_id", img.get("system:id"))
-
-    info = coll.map(_tag).select([]).getInfo()
-    return _candidates_from_feature_info(info)
-
-
-def _candidates_from_feature_info(info: dict) -> list[dict]:
-    candidates = []
-    for feat in info.get("features", []):
-        props = feat.get("properties", {})
-        timestamp = props.get("system:time_start")
-        asset_id = props.get("full_asset_id")
-        if timestamp is None or asset_id is None:
-            continue
-        candidates.append({
-            "asset_id": asset_id,
-            "date": datetime.fromtimestamp(timestamp / 1000).isoformat(),
-            "clear_score": props.get("local_clear_score"),
-        })
-    return candidates
-
-
-def select_by_local_clarity(candidates: list[dict], row: pd.Series) -> dict | None:
-    """Pick the AOI-locally-clearest scene, breaking ties by date proximity.
-
-    Tries CLEAR_SCORE_TIERS in order (0.75 / 0.6 / 0.4) and returns the
-    closest-by-date candidate within the first tier that has any match. Falls
-    back to closest-by-date regardless of clarity if nothing ever clears 0.4.
-    """
-    if not candidates:
-        return None
-    row_date = parse_date_object(row.get("Date", ""))
-
-    def _closest(pool: list[dict]) -> dict | None:
-        if row_date is None:
-            return pool[0]
-        best: tuple[int, dict] | None = None
-        for c in pool:
-            c_date = parse_date_object(c.get("date", ""))
-            if c_date is None:
-                continue
-            distance = abs((c_date - row_date).days)
-            if best is None or distance < best[0]:
-                best = (distance, c)
-        return best[1] if best else None
-
-    for min_score in CLEAR_SCORE_TIERS:
-        pool = [c for c in candidates if c.get("clear_score") is not None and c["clear_score"] >= min_score]
-        if not pool:
-            continue
-        picked = _closest(pool)
-        if picked is not None:
-            return picked
-
-    return _closest([c for c in candidates if c.get("clear_score") is not None]) or (candidates[0] if candidates else None)
 
 
 def extract_window_band_means(
@@ -564,13 +470,13 @@ def augment_with_sentinel2(
         if not date_start or not date_end:
             continue
 
-        candidates = _s2_local_clear_candidates(
+        candidates = s2_local_clear_candidates(
             first_row["longitude"], first_row["latitude"], date_start, date_end,
         )
         if not candidates:
             continue
 
-        selected = select_by_local_clarity(candidates, pd.Series({"Date": first_row["date_value"]}))
+        selected = select_by_local_clarity(candidates, first_row["date_value"])
         if selected is None:
             continue
 
@@ -663,13 +569,13 @@ def augment_with_landsat(
         if not date_start or not date_end:
             continue
 
-        candidates = _landsat_local_clear_candidates(
+        candidates = landsat_local_clear_candidates(
             first_row["longitude"], first_row["latitude"], date_start, date_end,
         )
         if not candidates:
             continue
 
-        selected = select_by_local_clarity(candidates, pd.Series({"Date": first_row["date_value"]}))
+        selected = select_by_local_clarity(candidates, first_row["date_value"])
         if selected is None:
             continue
 
