@@ -1,6 +1,7 @@
 import sys
 import argparse
 
+from superres import apply_decisions as _apply_decisions
 from superres import check_dataset
 from superres import create_sr_dataset
 from superres import download_and_preprocess
@@ -9,6 +10,9 @@ from superres import tile_dataset
 
 parser = argparse.ArgumentParser(description="Superres dataset entry")
 subparsers = parser.add_subparsers(dest="action", required=True)
+
+# Apply review decisions
+subparsers.add_parser("apply", help="Apply review decisions from review_dataset.py (see apply subcommand args)")
 
 # Check subcommand
 subparsers.add_parser("check", help="Check dataset integrity (see check subcommand args)")
@@ -28,7 +32,10 @@ subparsers.add_parser("tile", help="Tile dataset (see tile subcommand args)")
 args, remaining = parser.parse_known_args()
 
 # Forward remaining argv to the module-level parsers by shifting sys.argv
-if args.action == "check":
+if args.action == "apply":
+	sys.argv = [sys.argv[0]] + remaining
+	_apply_decisions.main()
+elif args.action == "check":
 	sys.argv = [sys.argv[0]] + remaining
 	check_dataset.check_dataset()
 elif args.action == "create":

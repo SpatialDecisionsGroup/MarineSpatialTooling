@@ -123,6 +123,31 @@ def _build_highres_identifier_fields(highres_manager, highres_image: Dict, aoi_g
     }
 
 
+def _cleanup_empty_sample_dirs(data_dir: Path, logger) -> None:
+    """Delete sample dirs that have no satellite imagery and no checkpoint.
+
+    These accumulate when a download is interrupted before writing any files,
+    or after apply_decisions clears a replace_both sample. Dirs with at least
+    one satellite subdir (landsat/ or sentinel2/) are left alone — they hold
+    partial downloads that download --resume can recover.
+    """
+    if not data_dir.exists():
+        return
+    removed = 0
+    for d in sorted(data_dir.glob("sample_*")):
+        if not d.is_dir():
+            continue
+        if (d / "sample_metadata.json").exists():
+            continue  # complete sample
+        if (d / "landsat").exists() or (d / "sentinel2").exists():
+            continue  # partial download — leave for download command
+        shutil.rmtree(d)
+        removed += 1
+    if removed:
+        logger.info("Cleaned up %d empty sample dir(s)", removed)
+        print(f"Cleaned up {removed} empty sample dir(s).")
+
+
 def _repair_broken_samples(metadata: DatasetMetadata, data_dir: Path, logger) -> List[int]:
     """Drop samples whose download partially failed and return their freed location_ids.
 
@@ -224,6 +249,8 @@ def create_dataset():
     logger = setup_logger("SRDatasetCreator", config.metadata_dir / "creation.log", level=logging.DEBUG)
 
     freed_location_ids: List[int] = []
+    if getattr(config, "resume", False):
+        _cleanup_empty_sample_dirs(config.data_dir, logger)
     if getattr(config, "check_existing", False):
         freed_location_ids = _repair_broken_samples(metadata, config.data_dir, logger)
 

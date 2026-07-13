@@ -116,8 +116,8 @@ class WorldPatchSampler:
                 self._habitat_gdfs[habitat_class] = gdf
                 self._habitat_components[habitat_class] = self._build_components(gdf)
                 self.logger.info(
-                    "Loaded %s habitat: %d polygons, total area %.4f deg²",
-                    habitat_class, len(gdf), gdf.geometry.area.sum(),
+                    "Loaded %s habitat: %d polygons",
+                    habitat_class, len(gdf),
                 )
             except Exception as exc:
                 self.logger.warning("Failed to load %s habitat: %s", habitat_class, exc)
@@ -284,11 +284,18 @@ class WorldPatchSampler:
         )
 
     def _build_components(self, gdf: gpd.GeoDataFrame):
-        """Pre-compute per-row area weights for random polygon selection."""
-        areas = gdf.geometry.area.values.astype(float)
+        """Pre-compute per-row area weights and bounds for random polygon selection."""
+        # Project to equal-area CRS so weights reflect true surface area, not degrees²
+        areas = gdf.geometry.to_crs("EPSG:6933").area.values.astype(float)
         total = areas.sum()
         weights = areas / total if total > 0 else np.ones(len(gdf)) / len(gdf)
-        return gdf, weights
+        # Cumulative weights let _sample_point_in_habitat use searchsorted (O(log n))
+        # instead of rng.choice(n, p=weights) which recomputes cumsum on every call.
+        cumweights = np.cumsum(weights)
+        cumweights[-1] = 1.0  # clamp floating-point drift
+        # Pre-extract bounds so the hot path avoids per-attempt geometry attribute access
+        bounds = np.array([geom.bounds for geom in gdf.geometry], dtype=np.float64)
+        return gdf, cumweights, bounds
 
     # ------------------------------------------------------------------
     # Depth lookup (metadata only)
@@ -360,15 +367,20 @@ class WorldPatchSampler:
         entry = self._habitat_components.get(habitat_class)
         if entry is None:
             return None
-        gdf, weights = entry
+        gdf, cumweights, bounds = entry
+        prep_cache: dict[int, object] = {}
 
         for _ in range(max_attempts):
-            # Pick a row proportional to area
-            row_idx = int(self._rng.choice(len(gdf), p=weights))
-            geom = gdf.geometry.iloc[row_idx]
+            # O(log n) weighted selection via precomputed cumulative weights
+            row_idx = int(np.searchsorted(cumweights, self._rng.random()))
+            row_idx = min(row_idx, len(gdf) - 1)
 
-            minx, miny, maxx, maxy = geom.bounds
-            prepared_geom = prep(geom)
+            minx, miny, maxx, maxy = bounds[row_idx]
+
+            # Cache prepared geometry — same polygon often selected multiple times
+            if row_idx not in prep_cache:
+                prep_cache[row_idx] = prep(gdf.geometry.iloc[row_idx])
+            prepared_geom = prep_cache[row_idx]
 
             # Rejection sampling within the bounding box
             for _ in range(64):
@@ -386,8 +398,15 @@ class WorldPatchSampler:
 
     def _build_patch_geometry(self, latitude, longitude):
         alignment_crs = get_utm_crs(latitude, longitude)
-        forward = Transformer.from_crs("EPSG:4326", alignment_crs, always_xy=True)
-        backward = Transformer.from_crs(alignment_crs, "EPSG:4326", always_xy=True)
+        # Cache transformers — Transformer.from_crs is expensive and UTM zones repeat
+        if not hasattr(self, "_transformer_cache"):
+            self._transformer_cache: dict[str, tuple] = {}
+        if alignment_crs not in self._transformer_cache:
+            self._transformer_cache[alignment_crs] = (
+                Transformer.from_crs("EPSG:4326", alignment_crs, always_xy=True),
+                Transformer.from_crs(alignment_crs, "EPSG:4326", always_xy=True),
+            )
+        forward, backward = self._transformer_cache[alignment_crs]
 
         center_x, center_y = forward.transform(longitude, latitude)
         half_size = self.patch_size_meters / 2.0

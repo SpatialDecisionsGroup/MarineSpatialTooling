@@ -231,14 +231,14 @@ def _render_lr_grid(
     lr_rgbs: list,
     loc_id: int,
     selected: set[str],
+    per_row: int = 5,
 ) -> None:
-    """Render Landsat images in rows of 4 with per-image select toggles."""
+    """Render Landsat images in rows with per-image select toggles."""
     if not lr_files:
         st.warning("No Landsat images found.")
         return
 
     n = len(lr_files)
-    per_row = 4
 
     for row_start in range(0, n, per_row):
         row_files = lr_files[row_start : row_start + per_row]
@@ -296,7 +296,7 @@ def main() -> None:
     # ── session state ─────────────────────────────────────────────────────────
     if "idx"          not in st.session_state: st.session_state.idx          = 0
     if "decisions"    not in st.session_state: st.session_state.decisions    = _load_decisions(decisions_path)
-    if "filter_mode"  not in st.session_state: st.session_state.filter_mode  = "all"
+    if "filter_mode"  not in st.session_state: st.session_state.filter_mode  = "unreviewed"
     if "stretch_mode" not in st.session_state: st.session_state.stretch_mode = "shared"
     if "lr_selected"  not in st.session_state: st.session_state.lr_selected  = {}
 
@@ -310,7 +310,7 @@ def main() -> None:
         return
 
     # Apply filter
-    if filter_mode == "unflagged":
+    if filter_mode == "unreviewed":
         visible = [i for i in all_ids if str(i) not in decisions]
     elif filter_mode == "flagged":
         visible = [i for i in all_ids
@@ -343,7 +343,7 @@ def main() -> None:
         c2.metric("Kept",     n_reviewed - n_flagged)
         c2.metric("Flagged",  n_flagged)
         st.progress(
-            n_reviewed / n_total if n_total else 0,
+            min(1.0, n_reviewed / n_total) if n_total else 0,
             text=f"{n_reviewed}/{n_total} reviewed",
         )
 
@@ -375,8 +375,8 @@ def main() -> None:
 
         st.subheader("Filter")
         new_filter = st.radio(
-            "Show", ["all", "unflagged", "flagged", "kept"],
-            index=["all", "unflagged", "flagged", "kept"].index(filter_mode),
+            "Show", ["all", "unreviewed", "flagged", "kept"],
+            index=["all", "unreviewed", "flagged", "kept"].index(filter_mode),
             label_visibility="collapsed",
         )
         if new_filter != filter_mode:
@@ -424,82 +424,25 @@ def main() -> None:
     dr_end      = (meta.get("date_range_end")   or "")[:10]
     patch_size_m = float(meta.get("patch_size_meters", 5120.0))
 
-    hcol, bcol = st.columns([5, 1])
+    # ── compact header ────────────────────────────────────────────────────────
+    depth_str = f"{depth_m:.0f} m" if isinstance(depth_m, (int, float)) else "?"
+    date_str  = f"{dr_start} → {dr_end}" if dr_start else ""
+    hcol, bcol = st.columns([6, 1])
     with hcol:
-        st.title(f"Sample #{loc_id}")
-        st.caption(
-            f"{habitat}  ·  ({lat}, {lon})"
-            + (f"  ·  {depth_m:.0f} m" if isinstance(depth_m, (int, float)) else "")
-            + (f"  ·  LR window {dr_start} → {dr_end}" if dr_start else "")
-        )
+        info = [f"**#{loc_id}**", habitat, f"({lat}, {lon})", depth_str]
+        if n_lr != "?":
+            info.append(f"{n_lr} LR images")
+        if date_str:
+            info.append(date_str)
+        st.markdown("  ·  ".join(info), unsafe_allow_html=True)
     with bcol:
         if current_dec:
             st.markdown(_decision_badge(current_dec), unsafe_allow_html=True)
 
-    # ── Landsat images ────────────────────────────────────────────────────────
+    # ── decision buttons ──────────────────────────────────────────────────────
     ls_dir   = data_dir / f"sample_{loc_id:06d}" / "landsat"
     lr_files = sorted(ls_dir.glob("*.tif")) if ls_dir.exists() else []
-
-    n_sel = len(selected)
-    hdr_col, sel_col = st.columns([3, 1])
-    with hdr_col:
-        st.subheader(
-            f"Landsat LR  ({len(lr_files)} images"
-            + (f", {n_sel} selected" if n_sel else "")
-            + ")"
-        )
-    with sel_col:
-        if n_sel:
-            if st.button("Clear selection", width='stretch'):
-                st.session_state.lr_selected[str(loc_id)] = set()
-                st.rerun()
-        else:
-            if st.button("Select all", width='stretch'):
-                st.session_state.lr_selected[str(loc_id)] = {f.name for f in lr_files}
-                st.rerun()
-
-    if lr_files:
-        if stretch_mode == "shared":
-            lr_rgbs = _load_lr_batch(lr_files, _LR_RGB, _LR_SCALE, _LR_OFFSET,
-                                     target_meters=patch_size_m)
-        else:
-            lr_rgbs = [_load_rgb(f, _LR_RGB, _LR_SCALE, _LR_OFFSET,
-                                 target_meters=patch_size_m) for f in lr_files]
-        _render_lr_grid(lr_files, lr_rgbs, loc_id, selected)
-    else:
-        st.warning("No Landsat images found.")
-
-    st.divider()
-
-    # ── Sentinel-2 + metadata ─────────────────────────────────────────────────
-    s2_dir   = data_dir / f"sample_{loc_id:06d}" / "sentinel2"
-    s2_files = sorted(s2_dir.glob("*.tif")) if s2_dir.exists() else []
-
-    img_col, meta_col = st.columns([1, 2])
-
-    with img_col:
-        st.subheader("Sentinel-2 HR")
-        if s2_files:
-            s2_rgb = _load_rgb(s2_files[0], _HR_RGB, _HR_SCALE, _HR_OFFSET)
-            if s2_rgb is not None:
-                st.image(s2_rgb, caption=s2_files[0].name, width='stretch')
-            else:
-                st.warning("Could not render HR image.")
-        else:
-            st.warning("No Sentinel-2 image found.")
-
-    with meta_col:
-        st.subheader("Metadata")
-        mc1, mc2 = st.columns(2)
-        mc1.metric("Habitat",      habitat)
-        mc1.metric("# LR images",  n_lr)
-        mc2.metric("Depth",        f"{depth_m:.0f} m" if isinstance(depth_m, (int, float)) else "?")
-        mc2.metric("Patch size",   f"{patch_size_m:.0f} m")
-
-    st.divider()
-
-    # ── action buttons ────────────────────────────────────────────────────────
-    st.subheader("Decision")
+    n_sel    = len(selected)
 
     def _record(action: str, files: list[str] | None = None) -> None:
         if action == "replace_lr" and files:
@@ -515,19 +458,12 @@ def main() -> None:
             _record(key)
         return _cb
 
-    # Standard action buttons
     btn_cols = st.columns(len(DECISIONS) + (1 if n_sel else 0))
     for col, (key, (label, _)) in zip(btn_cols, DECISIONS.items()):
         is_cur = (cur_action == key and not _get_selected_files(current_dec))
-        col.button(
-            label,
-            key=f"action_{key}",
-            on_click=_action_cb(key),
-            width='stretch',
-            type="primary" if is_cur else "secondary",
-        )
+        col.button(label, key=f"action_{key}", on_click=_action_cb(key),
+                   width='stretch', type="primary" if is_cur else "secondary")
 
-    # "Replace Selected" button only shown when images are selected
     if n_sel:
         sel_files = sorted(selected)
         is_cur_partial = (
@@ -535,23 +471,56 @@ def main() -> None:
             and current_dec.get("action") == "replace_lr"
             and set(current_dec.get("files", [])) == selected
         )
-
         def _replace_selected():
             _record("replace_lr", sel_files)
-
         btn_cols[-1].button(
-            f"Replace {n_sel} selected",
-            key="action_replace_selected",
-            on_click=_replace_selected,
-            width='stretch',
+            f"Replace {n_sel} selected", key="action_replace_selected",
+            on_click=_replace_selected, width='stretch',
             type="primary" if is_cur_partial else "secondary",
             help=f"Mark only the {n_sel} highlighted Landsat image(s) for replacement",
         )
 
-    st.caption(
-        "Click image date buttons to select/deselect individual Landsat images. "
-        "Decisions auto-advance to the next sample."
-    )
+    # ── images: S2 left, LR right ─────────────────────────────────────────────
+    s2_dir   = data_dir / f"sample_{loc_id:06d}" / "sentinel2"
+    s2_files = sorted(s2_dir.glob("*.tif")) if s2_dir.exists() else []
+
+    s2_col, lr_col = st.columns([1, 3])
+
+    with s2_col:
+        st.caption("Sentinel-2 HR")
+        if s2_files:
+            s2_rgb = _load_rgb(s2_files[0], _HR_RGB, _HR_SCALE, _HR_OFFSET)
+            if s2_rgb is not None:
+                st.image(s2_rgb, width='stretch')
+            else:
+                st.warning("No render")
+        else:
+            st.warning("No S2")
+
+    with lr_col:
+        sel_lbl = f" ({n_sel} selected)" if n_sel else ""
+        hdr_c, btn_c = st.columns([5, 1])
+        hdr_c.caption(f"Landsat LR — {len(lr_files)} images{sel_lbl}")
+        with btn_c:
+            if n_sel:
+                if st.button("Clear", key="clear_sel", width='stretch'):
+                    st.session_state.lr_selected[str(loc_id)] = set()
+                    st.rerun()
+            else:
+                if st.button("All", key="sel_all", width='stretch'):
+                    st.session_state.lr_selected[str(loc_id)] = {f.name for f in lr_files}
+                    st.rerun()
+
+        if lr_files:
+            if stretch_mode == "shared":
+                lr_rgbs = _load_lr_batch(lr_files, _LR_RGB, _LR_SCALE, _LR_OFFSET,
+                                         target_meters=patch_size_m)
+            else:
+                lr_rgbs = [_load_rgb(f, _LR_RGB, _LR_SCALE, _LR_OFFSET,
+                                     target_meters=patch_size_m) for f in lr_files]
+            _render_lr_grid(lr_files, lr_rgbs, loc_id, selected)
+        else:
+            st.warning("No Landsat images found.")
 
 
 if __name__ == "__main__":
