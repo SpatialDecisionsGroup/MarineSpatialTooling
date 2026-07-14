@@ -92,7 +92,7 @@ SEASONS = [
 ]
 
 # Directory structure
-DEFAULT_OUTPUT_DIR = "./superres"
+DEFAULT_OUTPUT_DIR = "./common"
 DATA_SUBDIR = "data"
 METADATA_SUBDIR = "metadata"
 CREDENTIALS_SUBDIR = "credentials"

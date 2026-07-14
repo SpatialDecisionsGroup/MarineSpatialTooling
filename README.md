@@ -74,7 +74,7 @@ All three are CC BY 4.0. Requires `curl`, `unzip`, and `python3`.
 uv run python setup_credentials.py
 ```
 
-Optional flags: `-o, --output-dir` (default `./superres/credentials`), `-p, --planet-key`
+Optional flags: `-o, --output-dir` (default `./common`), `-p, --planet-key`
 to pass the Planet API key non-interactively.
 
 The script will:
@@ -84,7 +84,7 @@ The script will:
 
 This creates:
 
-- `./superres/credentials/credentials.json` - Stores the Planet API key and GEE project ID
+- `./common/credentials.json` - Stores the Planet API key and GEE project ID
 - Earth Engine authentication is cached locally by the `ee` library
 
 If you skip either credential, you can re-run the setup script later to complete it.
@@ -119,7 +119,7 @@ threshold (`BOTTOM_VISIBILITY_KD490_MAX = 0.3 m⁻¹`) so only optically shallow
 On resume, any existing samples that predate the habitat-based schema are automatically
 deleted and their IDs reused.
 
-The scripts load credentials automatically from `./superres/credentials/credentials.json`.
+The scripts load credentials automatically from `./common/credentials.json`.
 
 **Outputs:**
 
@@ -139,7 +139,7 @@ uv run python superres.py download superres/metadata/dataset_manifest.csv
 - `--turbidity-file`: Path to a turbidity raster/NetCDF (default `./data/turbidity.nc`)
 - `--resume`: skip samples that already have a `sample_metadata.json` checkpoint
 
-The scripts load credentials automatically from `./superres/credentials/credentials.json`.
+The scripts load credentials automatically from `./common/credentials.json`.
 
 For each manifest row, this creates a Planet Orders API request, clips the source item to
 the sampled AOI, reprojects to the local UTM zone, and standardizes the resulting
@@ -304,14 +304,14 @@ superres/                              # default output root (-o ./superres)
 │   └── sample_000000/
 │       ├── sentinel2/
 │       └── landsat/
-├── metadata/
-│   ├── dataset_metadata.json      # Complete metadata
-│   ├── dataset_manifest.csv       # CSV manifest for download script
-│   ├── creation.log               # Creation logs
-│   └── download.log               # Download logs
-└── credentials/
-    └── credentials.json           # Planet API key + GEE project (EE auth is cached locally)
+└── metadata/
+    ├── dataset_metadata.json      # Complete metadata
+    ├── dataset_manifest.csv       # CSV manifest for download script
+    ├── creation.log               # Creation logs
+    └── download.log               # Download logs
 ```
+
+Credentials live outside this tree, in `./common/credentials.json` (see [Setup Credentials](#1-setup-credentials)).
 
 A sample is only considered complete once `sample_metadata.json` exists; until then,
 re-running `download` will pick up where it left off (see

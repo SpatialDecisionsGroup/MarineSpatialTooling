@@ -302,13 +302,13 @@ def config_download():
 
 def config_credentials():
     parser = argparse.ArgumentParser(description="Setup credentials for dataset creation")
-    parser.add_argument("-o", "--output-dir", default=str(Path(DEFAULT_OUTPUT_DIR) / CREDENTIALS_SUBDIR), help="Output directory for credentials")
+    parser.add_argument("-o", "--output-dir", default=DEFAULT_OUTPUT_DIR, help="Output directory for credentials")
     args = parser.parse_args()
     return Config(output_dir=str(Path(args.output_dir).parent))
 
 
 def build_credentials_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Setup credentials for dataset creation")
-    parser.add_argument("-o", "--output-dir", default=str(Path(DEFAULT_OUTPUT_DIR) / CREDENTIALS_SUBDIR), help="Output directory for credentials")
+    parser.add_argument("-o", "--output-dir", default=DEFAULT_OUTPUT_DIR, help="Output directory for credentials")
     parser.add_argument("-p", "--planet-key", help="Planet Labs API key")
     return parser
