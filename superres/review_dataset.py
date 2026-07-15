@@ -295,12 +295,12 @@ def main() -> None:
 
     # ── session state ─────────────────────────────────────────────────────────
     if "idx"          not in st.session_state: st.session_state.idx          = 0
-    if "decisions"    not in st.session_state: st.session_state.decisions    = _load_decisions(decisions_path)
     if "filter_mode"  not in st.session_state: st.session_state.filter_mode  = "unreviewed"
     if "stretch_mode" not in st.session_state: st.session_state.stretch_mode = "shared"
     if "lr_selected"  not in st.session_state: st.session_state.lr_selected  = {}
 
-    decisions    = st.session_state.decisions
+    # Reload decisions from disk every run so external changes (apply_decisions, etc.) are reflected
+    decisions = _load_decisions(decisions_path)
     all_ids      = _all_sample_ids(str(data_dir))
     filter_mode  = st.session_state.filter_mode
     stretch_mode = st.session_state.stretch_mode
@@ -445,11 +445,12 @@ def main() -> None:
     n_sel    = len(selected)
 
     def _record(action: str, files: list[str] | None = None) -> None:
+        current = _load_decisions(decisions_path)
         if action == "replace_lr" and files:
-            st.session_state.decisions[str(loc_id)] = {"action": "replace_lr", "files": files}
+            current[str(loc_id)] = {"action": "replace_lr", "files": files}
         else:
-            st.session_state.decisions[str(loc_id)] = action
-        _save_decisions(st.session_state.decisions, decisions_path)
+            current[str(loc_id)] = action
+        _save_decisions(current, decisions_path)
         if idx < len(visible) - 1:
             st.session_state.idx = idx + 1
 
