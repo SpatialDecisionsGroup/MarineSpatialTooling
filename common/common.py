@@ -48,6 +48,10 @@ def parse_date_object(value):
 		return None
 	if re.fullmatch(r"\d{8}", text):
 		parsed = pd.to_datetime(text, format="%Y%m%d", errors="coerce")
+	elif re.fullmatch(r"\d{4}-\d{2}-\d{2}", text):
+		# Unambiguous ISO — parse it explicitly rather than falling through to the
+		# dayfirst=True branch, which handles it correctly but warns on every call.
+		parsed = pd.to_datetime(text, format="%Y-%m-%d", errors="coerce")
 	elif "T" in text:
 		parsed = pd.to_datetime(text, errors="coerce")
 	else:
